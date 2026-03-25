@@ -41,6 +41,7 @@
 #include <QDialog>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QProcess>
 
 // --- OPENSSL CRYPTOGRAPHY ---
 #include <openssl/evp.h>
@@ -57,7 +58,7 @@ struct ChatMsg {
     bool isSystem;
     bool isSelf; 
     bool isVerified;
-    bool isTransient; // --- NEW: Prevents saving to the Vault ---
+    bool isTransient;
 };
 
 // --- OpenSSL Helper Functions ---
@@ -348,7 +349,6 @@ private slots:
     }
 
     void printHelp() {
-        // --- TRANSIENT LOGS: These won't be saved to the database ---
         log("--- SÖNKKÖKOODI COMMANDS ---", "[ * ]", true);
         log("nick <alias>   : Change your cryptographic alias", "[ * ]", true);
         log("who            : Display all active users in the room", "[ * ]", true);
@@ -362,13 +362,13 @@ private slots:
 
     void openSettings() {
         if (isLocked) {
-            log("Cannot access Settings while system is locked.", "[ ! ]", true); // Transient
+            log("Cannot access Settings while system is locked.", "[ ! ]", true);
             return;
         }
         
         QDialog dlg(this);
         dlg.setWindowFlags(Qt::FramelessWindowHint | Qt::Dialog);
-        dlg.resize(450, 350);
+        dlg.resize(450, 420);
         dlg.setStyleSheet("background-color: #000000; border: 2px solid #55FF55; color: #55FF55; font-family: 'Arial'; font-weight: bold; font-size: 16px;");
         
         QVBoxLayout *l = new QVBoxLayout(&dlg);
@@ -415,6 +415,15 @@ private slots:
         
         l->addSpacerItem(new QSpacerItem(20, 40, QSizePolicy::Minimum, QSizePolicy::Expanding));
 
+        // --- NEW UNINSTALL BUTTON ---
+        QPushButton *btnUninstall = new QPushButton("UNINSTALL SÖNKKÖKOODI", &dlg);
+        btnUninstall->setStyleSheet("QPushButton { background-color: #220000; border: 1px solid #FF3333; padding: 10px; color: #FF3333; } QPushButton:hover { background-color: #440000; color: #FFFFFF; }");
+        connect(btnUninstall, &QPushButton::clicked, &dlg, [&dlg, this]() {
+            dlg.reject(); 
+            QTimer::singleShot(100, this, &SecureChatApp::performUninstall);
+        });
+        l->addWidget(btnUninstall);
+
         QPushButton *btn = new QPushButton("SAVE & CLOSE", &dlg);
         btn->setStyleSheet("QPushButton { background-color: #222222; border: 1px solid #55FF55; padding: 10px; color: #FFFFFF; } QPushButton:hover { background-color: #333333; }");
         connect(btn, &QPushButton::clicked, &dlg, &QDialog::accept);
@@ -439,13 +448,84 @@ private slots:
                 autoLockTimer->stop();
             }
             
-            log("Settings saved locally.", "[ * ]", true); // Transient
+            log("Settings saved locally.", "[ * ]", true);
+        }
+    }
+
+    // --- SELF DESTRUCT / UNINSTALL LOGIC ---
+    void performUninstall() {
+        QDialog warnDlg(this);
+        warnDlg.setWindowFlags(Qt::FramelessWindowHint | Qt::Dialog);
+        warnDlg.resize(450, 250);
+        warnDlg.setStyleSheet("background-color: #000000; border: 2px solid #FF3333; color: #FF3333; font-family: 'Arial'; font-weight: bold; font-size: 16px;");
+        
+        QVBoxLayout *l = new QVBoxLayout(&warnDlg);
+        QLabel *lbl = new QLabel("CRITICAL WARNING", &warnDlg);
+        lbl->setAlignment(Qt::AlignCenter);
+        lbl->setStyleSheet("border: none; font-size: 22px;");
+        l->addWidget(lbl);
+        
+        QLabel *desc = new QLabel("This will permanently delete Sönkkökoodi, your cryptographic keys, your local vault, and all settings.\n\nProceed with self-destruct?", &warnDlg);
+        desc->setWordWrap(true);
+        desc->setAlignment(Qt::AlignCenter);
+        desc->setStyleSheet("border: none; color: #FFFFFF; font-size: 14px;");
+        l->addWidget(desc);
+        
+        QHBoxLayout *btnLayout = new QHBoxLayout();
+        QPushButton *btnCancel = new QPushButton("CANCEL", &warnDlg);
+        btnCancel->setStyleSheet("QPushButton { background-color: #222222; border: 1px solid #55FF55; color: #55FF55; padding: 10px; } QPushButton:hover { background-color: #333333; }");
+        connect(btnCancel, &QPushButton::clicked, &warnDlg, &QDialog::reject);
+        
+        QPushButton *btnConfirm = new QPushButton("ERASE EVERYTHING", &warnDlg);
+        btnConfirm->setStyleSheet("QPushButton { background-color: #330000; border: 1px solid #FF3333; color: #FF3333; padding: 10px; } QPushButton:hover { background-color: #660000; color: #FFFFFF; }");
+        connect(btnConfirm, &QPushButton::clicked, &warnDlg, &QDialog::accept);
+        
+        btnLayout->addWidget(btnCancel);
+        btnLayout->addWidget(btnConfirm);
+        l->addLayout(btnLayout);
+        
+        if (warnDlg.exec() == QDialog::Accepted) {
+            
+            // 1. Remove Auto-Start from Registry (Windows)
+#ifdef Q_OS_WIN
+            QSettings bootSettings("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", QSettings::NativeFormat);
+            bootSettings.remove("Sonkkokoodi");
+#endif
+            
+            // 2. Remove Desktop Shortcut
+            QString shortcutPath = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation) + "/Sönkkökoodi.lnk";
+            QFile::remove(shortcutPath);
+            
+            // 3. Initiate Self-Destruct Sequence
+            QDir appDir(QCoreApplication::applicationDirPath());
+            
+            // Go up one level if we are running from the "build" folder created by the installer
+            if (appDir.dirName().toLower() == "build") {
+                appDir.cdUp();
+            }
+            
+            QString targetDir = appDir.absolutePath();
+            
+            // Safety check: Only proceed if the target directory has 'Sonkkokoodi' in its path
+            if (targetDir.contains("Sonkkokoodi", Qt::CaseInsensitive)) {
+#ifdef Q_OS_WIN
+                QString nativeDir = QDir::toNativeSeparators(targetDir);
+                // Ping acts as a 2 second sleep to let the app close, then rmdir recursively wipes the folder
+                QString cmd = QString("cmd.exe /C \"ping 127.0.0.1 -n 3 > Nul & rmdir /s /q \"%1\"\"").arg(nativeDir);
+                QProcess::startDetached(cmd);
+#elif defined(Q_OS_LINUX)
+                QString cmd = QString("sh -c \"sleep 2 && rm -rf '%1'\"").arg(targetDir);
+                QProcess::startDetached(cmd);
+#endif
+            }
+            
+            QApplication::quit();
         }
     }
 
     void openNotes() {
         if (isLocked || vaultKey.isEmpty()) {
-            log("Cannot access Sönkkö Notes while system is locked.", "[ ! ]", true); // Transient
+            log("Cannot access Sönkkö Notes while system is locked.", "[ ! ]", true);
             return;
         }
         
@@ -491,7 +571,7 @@ private slots:
 
     void openTofuList() {
         if (isLocked) {
-            log("Cannot access TOFU List while system is locked.", "[ ! ]", true); // Transient
+            log("Cannot access TOFU List while system is locked.", "[ ! ]", true);
             return;
         }
         
@@ -614,6 +694,15 @@ private slots:
         });
     }
 
+    void enableAutoStart() {
+        QString appPath = QCoreApplication::applicationFilePath();
+#ifdef Q_OS_WIN
+        QSettings bootSettings("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", QSettings::NativeFormat);
+        bootSettings.setValue("Sonkkokoodi", QDir::toNativeSeparators(appPath));
+        log("Windows Boot Sequence Injected.", "[ * ]", true);
+#endif
+    }
+
     void handlePwdSubmit() {
         QString input = pwdInput->text();
         if (input.isEmpty()) return;
@@ -669,8 +758,6 @@ private slots:
         pwdInput->clear();
         pwdInput->setFocus();
         contentArea->setStyleSheet("#mainContent { background-color: #000000; border: 2px solid #FF3333; border-top: none; }");
-        
-        // --- TRANSIENT LOG: Won't save to the database ---
         log("Locked. Displaying raw AES-GCM sönkkökoodi.", "[ * ]", true);
         refreshChatDisplay();
         
@@ -727,6 +814,7 @@ private slots:
             myNickname = text;
             
             generateIdentityKey();
+            enableAutoStart();
             setupStep = 0;
             unlockSystem();
             return;
@@ -750,7 +838,7 @@ private slots:
             if (tcpSocket && tcpSocket->state() == QAbstractSocket::ConnectedState) {
                 QJsonObject reqObj; reqObj["type"] = "WHO_REQ";
                 sendSignedPacket(reqObj);
-                log("Locating active peers...", "[ * ]", true); // Transient
+                log("Locating active peers...", "[ * ]", true);
             }
             return;
         } else if (lowerText.startsWith("nick ")) {
@@ -816,7 +904,7 @@ private slots:
             promptLabel->setText(">");
         });
         connect(tcpSocket, &QTcpSocket::disconnected, this, [this](){
-            log("Disconnected.", "[ * ]", true); // Transient
+            log("Disconnected.", "[ * ]", true); 
             tcpSocket->deleteLater(); 
             tcpSocket = nullptr; 
             promptLabel->setText(">");
@@ -843,7 +931,7 @@ private:
 
         QJsonArray arr;
         for (const ChatMsg &m : history) {
-            if (m.isTransient) continue; // --- FIX: skips help menus and lock messages ---
+            if (m.isTransient) continue;
             
             QJsonObject obj;
             obj["time"] = m.time;
@@ -894,7 +982,7 @@ private:
             m.isSystem = obj["isSystem"].toBool();
             m.isSelf = obj["isSelf"].toBool();
             m.isVerified = obj["isVerified"].toBool();
-            m.isTransient = false; // Loaded items are permanent
+            m.isTransient = false; 
             history.append(m);
         }
     }
@@ -1233,7 +1321,6 @@ private:
 
     QString getTime() { return QDateTime::currentDateTime().toString("HH:mm:ss"); }
 
-    // --- ADDED isTransient PARAMETER ---
     void log(const QString &text, const QString &prefix = "[ * ]", bool isTransient = false) { 
         saveMessage(prefix, text, QByteArray(), true, false, false, isTransient); 
     }
