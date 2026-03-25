@@ -287,11 +287,14 @@ private slots:
     void createShortcut(const QString &installDir) {
         log("Creating desktop shortcut...");
         
-        QString exePath = installDir + "/sonkkokoodi.exe";
+        // --- FIXED: Appended "/build" to the paths to match your zip structure ---
+        QString exePath = installDir + "/build/sonkkokoodi.exe";
+        QString workDir = installDir + "/build"; 
         QString shortcutPath = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation) + "/Sönkkökoodi.lnk";
 
+        // Pass the updated workDir to the PowerShell shortcut creator
         QString psCommand = QString("$wshell = New-Object -ComObject WScript.Shell; $s = $wshell.CreateShortcut('%1'); $s.TargetPath = '%2'; $s.WorkingDirectory = '%3'; $s.Save();")
-                            .arg(shortcutPath, exePath, installDir);
+                            .arg(shortcutPath, exePath, workDir);
 
         QProcess *process = new QProcess(this);
         connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, process](int exitCode, QProcess::ExitStatus) {
