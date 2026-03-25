@@ -415,7 +415,6 @@ private slots:
         
         l->addSpacerItem(new QSpacerItem(20, 40, QSizePolicy::Minimum, QSizePolicy::Expanding));
 
-        // --- NEW UNINSTALL BUTTON ---
         QPushButton *btnUninstall = new QPushButton("UNINSTALL SÖNKKÖKOODI", &dlg);
         btnUninstall->setStyleSheet("QPushButton { background-color: #220000; border: 1px solid #FF3333; padding: 10px; color: #FF3333; } QPushButton:hover { background-color: #440000; color: #FFFFFF; }");
         connect(btnUninstall, &QPushButton::clicked, &dlg, [&dlg, this]() {
@@ -452,7 +451,6 @@ private slots:
         }
     }
 
-    // --- SELF DESTRUCT / UNINSTALL LOGIC ---
     void performUninstall() {
         QDialog warnDlg(this);
         warnDlg.setWindowFlags(Qt::FramelessWindowHint | Qt::Dialog);
@@ -486,36 +484,28 @@ private slots:
         
         if (warnDlg.exec() == QDialog::Accepted) {
             
-            // 1. Remove Auto-Start from Registry (Windows)
 #ifdef Q_OS_WIN
             QSettings bootSettings("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", QSettings::NativeFormat);
             bootSettings.remove("Sonkkokoodi");
 #endif
             
-            // 2. Remove Desktop Shortcut
             QString shortcutPath = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation) + "/Sönkkökoodi.lnk";
             QFile::remove(shortcutPath);
             
-            // 3. Initiate Self-Destruct Sequence
             QDir appDir(QCoreApplication::applicationDirPath());
-            
-            // Go up one level if we are running from the "build" folder created by the installer
             if (appDir.dirName().toLower() == "build") {
                 appDir.cdUp();
             }
             
             QString targetDir = appDir.absolutePath();
             
-            // Safety check: Only proceed if the target directory has 'Sonkkokoodi' in its path
             if (targetDir.contains("Sonkkokoodi", Qt::CaseInsensitive)) {
 #ifdef Q_OS_WIN
-                QString nativeDir = QDir::toNativeSeparators(targetDir);
-                // Ping acts as a 2 second sleep to let the app close, then rmdir recursively wipes the folder
-                QString cmd = QString("cmd.exe /C \"ping 127.0.0.1 -n 3 > Nul & rmdir /s /q \"%1\"\"").arg(nativeDir);
-                QProcess::startDetached(cmd);
+                QString psCmd = QString("Start-Sleep -Seconds 2; Remove-Item -Path '%1' -Recurse -Force").arg(targetDir);
+                QProcess::startDetached("powershell.exe", QStringList() << "-WindowStyle" << "Hidden" << "-Command" << psCmd, QDir::tempPath());
 #elif defined(Q_OS_LINUX)
                 QString cmd = QString("sh -c \"sleep 2 && rm -rf '%1'\"").arg(targetDir);
-                QProcess::startDetached(cmd);
+                QProcess::startDetached(cmd, QStringList(), QDir::tempPath());
 #endif
             }
             
