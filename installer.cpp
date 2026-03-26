@@ -287,26 +287,29 @@ private slots:
     void createShortcut(const QString &installDir) {
         log("Creating desktop shortcut...");
         
-        // --- FIXED: Appended "/build" to the paths to match your zip structure ---
-        QString exePath = installDir + "/build/sonkkokoodi.exe";
-        QString workDir = installDir + "/build"; 
+        // Ensure path points directly to the executable in the root of the install dir
+        QString exePath = installDir + "/sonkkokoodi.exe";
         QString shortcutPath = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation) + "/Sönkkökoodi.lnk";
 
-        // Pass the updated workDir to the PowerShell shortcut creator
         QString psCommand = QString("$wshell = New-Object -ComObject WScript.Shell; $s = $wshell.CreateShortcut('%1'); $s.TargetPath = '%2'; $s.WorkingDirectory = '%3'; $s.Save();")
-                            .arg(shortcutPath, exePath, workDir);
+                            .arg(shortcutPath, exePath, installDir);
 
         QProcess *process = new QProcess(this);
-        connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, process](int exitCode, QProcess::ExitStatus) {
+        connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, process, exePath, installDir](int exitCode, QProcess::ExitStatus) {
             process->deleteLater();
             log("------------------------------------------");
             log("Installation complete.");
             log("You can now launch the app from your Desktop.");
-            btnInstall->setText("INSTALLATION COMPLETE. EXIT.");
+            
+            // --- UPDATED LOGIC: LAUNCH APP & EXIT ---
+            btnInstall->setText("LAUNCH SÖNKKÖKOODI & EXIT");
             btnInstall->setEnabled(true);
             
             disconnect(btnInstall, &QPushButton::clicked, this, &InstallerApp::startInstall);
-            connect(btnInstall, &QPushButton::clicked, [this]() { QApplication::quit(); });
+            connect(btnInstall, &QPushButton::clicked, [exePath, installDir]() { 
+                QProcess::startDetached(exePath, QStringList(), installDir);
+                QApplication::quit(); 
+            });
         });
 
         process->start("powershell.exe", QStringList() << "-NoProfile" << "-Command" << psCommand);
