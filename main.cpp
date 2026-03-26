@@ -149,7 +149,7 @@ public:
 
         QPushButton *btnClose = new QPushButton("X", this);
         btnClose->setStyleSheet(btnStyle + "QPushButton:hover { color: #55FF55; }");
-        connect(btnClose, &QPushButton::clicked, [this]() { m_parent->showMinimized(); });
+        connect(btnClose, &QPushButton::clicked, [this]() { m_parent->hide(); });
         layout->addWidget(btnClose);
     }
 
@@ -195,7 +195,7 @@ class SecureChatApp : public QMainWindow {
     Q_OBJECT
 public:
     SecureChatApp() {
-        setWindowFlags(Qt::FramelessWindowHint | Qt::WindowSystemMenuHint | Qt::WindowMinimizeButtonHint);
+        setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
         setAttribute(Qt::WA_TranslucentBackground);
         resize(1200, 800);
 
@@ -300,6 +300,11 @@ public:
         if (myEphemeralKey) EVP_PKEY_free(myEphemeralKey);
     }
 
+    // --- CHECK FOR MINIMIZED START ---
+    bool isSetupComplete() const {
+        return setupStep == 0;
+    }
+
 protected:
     void showEvent(QShowEvent *event) override {
         QMainWindow::showEvent(event);
@@ -323,7 +328,7 @@ protected:
     void keyPressEvent(QKeyEvent *event) override {
         if (autoLockMinutes > 0) autoLockTimer->start(); 
         
-        if (isLocked && setupStep != 2) {
+        if (isLocked && setupStep != 2 && setupStep != 3) {
             if (!event->text().isEmpty() && !pwdInput->hasFocus()) {
                 pwdInput->setFocus();
                 QApplication::sendEvent(pwdInput, event);
@@ -608,11 +613,8 @@ private slots:
         QString configPath = QCoreApplication::applicationDirPath() + "/sonkkokoodi.ini";
         QSettings settings(configPath, QSettings::IniFormat);
         
-        if (!settings.contains("server_ip")) settings.setValue("server_ip", "127.0.0.1");
-        if (!settings.contains("server_port")) settings.setValue("server_port", 9999);
-
-        targetIp = settings.value("server_ip").toString();
-        targetPort = settings.value("server_port").toInt();
+        targetIp = settings.value("server_ip", "").toString();
+        targetPort = settings.value("server_port", 9999).toInt();
         storedPinHash = settings.value("pin_hash").toString();
         myNickname = settings.value("nickname").toString();
         QString pemData = settings.value("ecdsa_identity").toString();
@@ -638,7 +640,7 @@ private slots:
         }
         settings.endGroup();
 
-        if (storedPinHash.isEmpty() || myNickname.isEmpty() || !myIdentityKey || vaultSalt.isEmpty()) {
+        if (storedPinHash.isEmpty() || myNickname.isEmpty() || !myIdentityKey || vaultSalt.isEmpty() || targetIp.isEmpty()) {
             setupStep = 1;
             isLocked = true;
             msgContainer->hide();
@@ -804,6 +806,34 @@ private slots:
             myNickname = text;
             
             generateIdentityKey();
+            
+            setupStep = 3;
+            msgInput->clear();
+            msgInput->setPlaceholderText("SETUP: ENTER SERVER IP (e.g. 192.168.1.50:9999)...");
+            promptLabel->setText("server >");
+            msgInput->setFocus();
+            log("Alias saved. Step 3: Enter target server IP and port.", "[ * ]", true);
+            return;
+        }
+
+        if (setupStep == 3) {
+            chatDisplay->append("<span style='color:#55FF55;'>server > </span><span style='color:#FFFFFF;'>" + text + "</span>");
+            
+            QString ip = text;
+            int port = 9999;
+            if (text.contains(":")) {
+                QStringList parts = text.split(":");
+                ip = parts[0];
+                port = parts[1].toInt();
+            }
+            
+            QString configPath = QCoreApplication::applicationDirPath() + "/sonkkokoodi.ini";
+            QSettings settings(configPath, QSettings::IniFormat);
+            settings.setValue("server_ip", ip);
+            settings.setValue("server_port", port);
+            targetIp = ip;
+            targetPort = port;
+            
             enableAutoStart();
             setupStep = 0;
             unlockSystem();
@@ -879,6 +909,11 @@ private slots:
     }
 
     void connectToPeer() {
+        if (targetIp.isEmpty()) {
+            log("No target IP defined. Use 'server <ip>' command first.", "[ ! ]", true);
+            return;
+        }
+        
         if (tcpSocket) tcpSocket->deleteLater();
         tcpSocket = new QTcpSocket(this);
         
@@ -903,6 +938,16 @@ private slots:
         });
 
         tcpSocket->connectToHost(targetIp, targetPort);
+    }
+
+    void sendNativeNotification(const QString &title, const QString &msg) {
+#ifdef Q_OS_LINUX
+        QProcess::startDetached("notify-send", QStringList() << "-a" << "Sönkkökoodi" << "-i" << "utilities-terminal" << title << msg);
+#else
+        if (trayIcon) {
+            trayIcon->showMessage(title, msg, QSystemTrayIcon::NoIcon, 3000);
+        }
+#endif
     }
 
 private: 
@@ -1143,7 +1188,7 @@ private:
                 log(joinNick + " is negotiating a connection...", "[ * ]", true);
                 
                 if (notifyConnect) {
-                    trayIcon->showMessage("Connection", joinNick + " is joining the room.", QSystemTrayIcon::NoIcon, 3000);
+                    sendNativeNotification("Connection", joinNick + " is joining the room.");
                 }
                 
                 QByteArray targetEcdhDer = QByteArray::fromBase64(payload["ecdh_pub"].toString().toUtf8());
@@ -1201,7 +1246,7 @@ private:
                 log(leaveNick + " has left the room.", "[ * ]", true);
                 
                 if (notifyDisconnect) {
-                    trayIcon->showMessage("Disconnection", leaveNick + " has left the room.", QSystemTrayIcon::NoIcon, 3000);
+                    sendNativeNotification("Disconnection", leaveNick + " has left the room.");
                 }
             }
             else if (type == "WHO_REQ") {
@@ -1282,7 +1327,7 @@ private:
                     saveMessage("", text, cipherBytes, false, false, isVerified);
                     
                     if (notifyMessage && !isSpoofed && !isLocked) {
-                        trayIcon->showMessage("New Message", "Message from " + senderNick, QSystemTrayIcon::NoIcon, 3000);
+                        sendNativeNotification("New Message", "Message from " + senderNick);
                     }
                     
                     msgCount++;
@@ -1420,7 +1465,16 @@ private:
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
+    
+    // --- LINUX FIX: Tell GNOME which .desktop file belongs to us ---
+    QGuiApplication::setDesktopFileName("sonkkokoodi.desktop");
+    
     SecureChatApp window;
-    window.show();
+    
+    // --- STARTUP LOGIC: Hide if setup is complete, otherwise show UI ---
+    if (!window.isSetupComplete()) {
+        window.show();
+    }
+    
     return app.exec();
 }
