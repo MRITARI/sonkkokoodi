@@ -212,7 +212,8 @@ private slots:
 
                 for (const QJsonValue &assetVal : assets) {
                     QJsonObject assetObj = assetVal.toObject();
-                    if (assetObj["name"].toString().endsWith(".zip", Qt::CaseInsensitive)) {
+                    const QString assetName = assetObj["name"].toString();
+                    if (assetName.endsWith(".zip", Qt::CaseInsensitive) && !assetName.contains("installer", Qt::CaseInsensitive)) {
                         downloadUrl = assetObj["browser_download_url"].toString();
                         digest = assetObj["digest"].toString();   // "sha256:<hex>" when GitHub provides it
                         break;

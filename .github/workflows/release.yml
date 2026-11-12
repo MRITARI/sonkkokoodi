@@ -1,0 +1,80 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:        # manual run: builds and uploads an artifact, but does not publish a release
+
+permissions:
+  contents: write           # needed to create the release
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-qt6-base
+            mingw-w64-ucrt-x86_64-openssl
+            zip
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Package app
+        run: |
+          mkdir -p dist
+          cp build/sonkkokoodi.exe dist/
+          # Qt plugins + Qt DLLs
+          windeployqt-qt6 --no-translations --release dist/sonkkokoodi.exe
+          # Remaining runtime DLLs (OpenSSL, MinGW runtime, ...)
+          ldd dist/sonkkokoodi.exe | awk '/ucrt64/ {print $3}' | xargs -r cp -n -t dist/
+          (cd dist && zip -r ../Sonkkokoodi-${GITHUB_REF_NAME:-dev}-windows.zip .)
+
+      - name: Collect installer
+        run: |
+          # The installer itself needs Qt too; ship it self-contained in its own zip.
+          # (The installer skips assets with "installer" in the name when picking the app zip.)
+          mkdir -p installer_dist
+          cp build/sonkkokoodi_installer.exe installer_dist/
+          windeployqt-qt6 --no-translations --release installer_dist/sonkkokoodi_installer.exe
+          ldd installer_dist/sonkkokoodi_installer.exe | awk '/ucrt64/ {print $3}' | xargs -r cp -n -t installer_dist/
+          (cd installer_dist && zip -r ../Sonkkokoodi-Installer-${GITHUB_REF_NAME:-dev}.zip .)
+
+      - name: Checksums
+        run: sha256sum Sonkkokoodi-*.zip > SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: |
+            Sonkkokoodi-*.zip
+            SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Sonkkokoodi-*-windows.zip
+            Sonkkokoodi-Installer-*.zip
+            SHA256SUMS.txt
+          generate_release_notes: true
