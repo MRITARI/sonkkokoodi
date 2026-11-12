@@ -84,15 +84,18 @@ async def handle_client(reader, writer):
 async def broadcast(data: bytes, exclude_writer: asyncio.StreamWriter):
     """Safely iterates through active clients and sends data."""
     dead_clients = set()
-    
-    for client in active_clients:
-        if client != exclude_writer:
-            try:
-                client.write(data)
-                await client.drain()
-            except Exception:
-                # If a socket is broken but hasn't fully closed yet, mark it for execution
-                dead_clients.add(client)
+
+    async def send(client):
+        try:
+            client.write(data)
+            # A slow/stalled reader must not hold up everyone else.
+            await asyncio.wait_for(client.drain(), timeout=5)
+        except Exception:
+            # Broken or stalled socket: mark it for removal
+            dead_clients.add(client)
+
+    targets = [c for c in list(active_clients) if c != exclude_writer]
+    await asyncio.gather(*(send(c) for c in targets))
 
     # Clean up ghost sockets
     for dead in dead_clients:

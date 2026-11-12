@@ -5,6 +5,11 @@ project(Sonkkokoodi VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# The sources contain UTF-8 literals (Sönkkökoodi, ✓, ≡); MSVC needs to be told
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 # Enable Qt auto-generators
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
@@ -36,15 +41,18 @@ set_target_properties(sonkkokoodi PROPERTIES WIN32_EXECUTABLE TRUE)
 # ==============================================================================
 # 2. THE DEPLOYMENT INSTALLER
 # ==============================================================================
-add_executable(sonkkokoodi_installer installer.cpp)
+# The installer relies on PowerShell and .lnk shortcuts, so it is Windows-only.
+if(WIN32)
+    add_executable(sonkkokoodi_installer installer.cpp)
 
-# The installer doesn't need OpenSSL, just Qt UI and Networking
-target_link_libraries(sonkkokoodi_installer PRIVATE
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Widgets
-    Qt6::Network
-)
+    # The installer doesn't need OpenSSL, just Qt UI and Networking
+    target_link_libraries(sonkkokoodi_installer PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Network
+    )
 
-# Hide the black console window on Windows (Ignored on Linux)
-set_target_properties(sonkkokoodi_installer PROPERTIES WIN32_EXECUTABLE TRUE)
+    # Hide the black console window
+    set_target_properties(sonkkokoodi_installer PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()

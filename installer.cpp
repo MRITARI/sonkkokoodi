@@ -22,6 +22,11 @@
 #include <QPolygon>
 #include <QMouseEvent>
 #include <QDateTime>
+#include <QSpacerItem>
+#include <QCryptographicHash>
+#include <QDirIterator>
+#include <QFileInfo>
+#include <QProcessEnvironment>
 
 // =========================================================================
 // CONFIGURATION: CHANGE THIS TO YOUR GITHUB REPOSITORY
@@ -88,6 +93,7 @@ public:
 
         networkManager = new QNetworkAccessManager(this);
         downloadReply = nullptr;
+        zipFile = nullptr;
 
         QWidget *centralWidget = new QWidget(this);
         setCentralWidget(centralWidget);
@@ -145,9 +151,23 @@ public:
         fetchReleases();
     }
 
+    ~InstallerApp() {
+        // Closing the window mid-download must not leave a half-written zip behind.
+        if (downloadReply) {
+            downloadReply->disconnect(this);
+            downloadReply->abort();
+        }
+        if (zipFile) {
+            zipFile->close();
+            delete zipFile;
+            zipFile = nullptr;
+            QFile::remove(tempZipPath);
+        }
+    }
+
 private slots:
     void fetchReleases() {
-        QString apiUrl = "https://api.github.com/repos/" + GITHUB_REPO + "/releases";
+        QString apiUrl = "https://api.github.com/repos/" + GITHUB_REPO + "/releases?per_page=100";
         QNetworkRequest request((QUrl(apiUrl)));
         request.setRawHeader("User-Agent", "Sonkkokoodi-Installer-v1.0");
 
@@ -162,6 +182,13 @@ private slots:
             }
 
             QJsonDocument jsonResponse = QJsonDocument::fromJson(reply->readAll());
+            if (!jsonResponse.isArray()) {
+                // e.g. rate limiting returns an object with a "message"
+                QString msg = jsonResponse.isObject() ? jsonResponse.object()["message"].toString() : QString("unexpected response");
+                log("GitHub API returned an unexpected answer: " + msg);
+                releaseCombo->setItemText(0, "Failed to fetch releases.");
+                return;
+            }
             QJsonArray releasesArray = jsonResponse.array();
 
             releaseCombo->clear();
@@ -175,23 +202,28 @@ private slots:
 
             for (const QJsonValue &value : releasesArray) {
                 QJsonObject releaseObj = value.toObject();
+                if (releaseObj["draft"].toBool()) continue;
                 QString tagName = releaseObj["tag_name"].toString();
                 QString releaseName = releaseObj["name"].toString();
-                
+
                 QJsonArray assets = releaseObj["assets"].toArray();
                 QString downloadUrl = "";
-                
+                QString digest = "";
+
                 for (const QJsonValue &assetVal : assets) {
                     QJsonObject assetObj = assetVal.toObject();
-                    if (assetObj["name"].toString().endsWith(".zip")) {
+                    if (assetObj["name"].toString().endsWith(".zip", Qt::CaseInsensitive)) {
                         downloadUrl = assetObj["browser_download_url"].toString();
+                        digest = assetObj["digest"].toString();   // "sha256:<hex>" when GitHub provides it
                         break;
                     }
                 }
 
-                if (!downloadUrl.isEmpty()) {
+                if (!downloadUrl.isEmpty() && downloadUrl.startsWith("https://")) {
                     QString display = tagName + " - " + releaseName;
-                    releaseCombo->addItem(display, downloadUrl); 
+                    if (releaseObj["prerelease"].toBool()) display += " (pre-release)";
+                    releaseCombo->addItem(display, downloadUrl);
+                    releaseCombo->setItemData(releaseCombo->count() - 1, digest, Qt::UserRole + 1);
                 }
             }
 
@@ -211,7 +243,10 @@ private slots:
         releaseCombo->setEnabled(false);
         
         QString downloadUrl = releaseCombo->currentData().toString();
+        expectedDigest = releaseCombo->currentData(Qt::UserRole + 1).toString().toLower();
         tempZipPath = QStandardPaths::writableLocation(QStandardPaths::TempLocation) + "/sonkko_install.zip";
+        writeFailed = false;
+        progressBar->setValue(0);
 
         log("Starting download...");
         log("Target URL: " + downloadUrl);
@@ -223,15 +258,17 @@ private slots:
         zipFile = new QFile(tempZipPath);
         if (!zipFile->open(QIODevice::WriteOnly)) {
             log("Error: Cannot write to temporary directory.");
+            delete zipFile;
+            zipFile = nullptr;
             btnInstall->setEnabled(true);
             releaseCombo->setEnabled(true);
             return;
         }
 
         downloadReply = networkManager->get(request);
-        
+
         connect(downloadReply, &QNetworkReply::readyRead, this, [this]() {
-            if (zipFile) zipFile->write(downloadReply->readAll());
+            writeChunk(downloadReply->readAll());
         });
         
         connect(downloadReply, &QNetworkReply::downloadProgress, this, [this](qint64 bytesRead, qint64 totalBytes) {
@@ -244,63 +281,134 @@ private slots:
         connect(downloadReply, &QNetworkReply::finished, this, &InstallerApp::onDownloadFinished);
     }
 
+    void writeChunk(const QByteArray &data) {
+        if (!zipFile || data.isEmpty() || writeFailed) return;
+        if (zipFile->write(data) != data.size()) writeFailed = true;   // e.g. disk full
+    }
+
+    void resetUi() {
+        btnInstall->setEnabled(true);
+        releaseCombo->setEnabled(true);
+    }
+
     void onDownloadFinished() {
+        QNetworkReply *reply = downloadReply;
+        downloadReply = nullptr;
+
+        // Data that arrived without a final readyRead must not be lost.
+        writeChunk(reply->readAll());
+
         zipFile->close();
         delete zipFile;
         zipFile = nullptr;
 
-        if (downloadReply->error() != QNetworkReply::NoError) {
-            log("Download failed: " + downloadReply->errorString());
-            downloadReply->deleteLater();
-            btnInstall->setEnabled(true);
-            releaseCombo->setEnabled(true);
+        QNetworkReply::NetworkError err = reply->error();
+        QString errText = reply->errorString();
+        reply->deleteLater();
+
+        if (err != QNetworkReply::NoError || writeFailed) {
+            log(writeFailed ? QString("Download failed: could not write to disk.") : "Download failed: " + errText);
+            QFile::remove(tempZipPath);
+            resetUi();
             return;
         }
-        
-        downloadReply->deleteLater();
+
         log("Download complete.");
+
+        // Integrity check against the digest published by GitHub for this asset.
+        if (expectedDigest.startsWith("sha256:")) {
+            QFile f(tempZipPath);
+            QByteArray actual;
+            if (f.open(QIODevice::ReadOnly)) {
+                QCryptographicHash h(QCryptographicHash::Sha256);
+                h.addData(&f);
+                actual = h.result().toHex();
+            }
+            if (actual.isEmpty() || QString::fromLatin1(actual) != expectedDigest.mid(7)) {
+                log("SHA-256 mismatch - the download is corrupt or has been tampered with. Aborting.");
+                f.close();
+                QFile::remove(tempZipPath);
+                resetUi();
+                return;
+            }
+            log("SHA-256 verified.");
+        } else {
+            log("Warning: GitHub published no checksum for this release, integrity could not be verified.");
+        }
+
         log("Extracting files...");
 
-        QString installDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/Sonkkokoodi";
+        QString legacyDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/Sonkkokoodi";
+        QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "/Sonkkokoodi";
+        // Keep upgrading an existing installation in place so its settings and vault stay with it.
+        if (QFileInfo::exists(legacyDir + "/sonkkokoodi.exe")) installDir = legacyDir;
         QDir().mkpath(installDir);
 
-        QProcess *process = new QProcess(this);
-        QString psCommand = QString("Expand-Archive -Path '%1' -DestinationPath '%2' -Force").arg(tempZipPath, installDir);
-        
-        connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, installDir, process](int exitCode, QProcess::ExitStatus exitStatus) {
-            process->deleteLater();
-            QFile::remove(tempZipPath); 
+        // Paths are passed through the environment, never spliced into the command text,
+        // so quotes/apostrophes in a user name cannot break (or inject into) the command.
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert("SK_ZIP", QDir::toNativeSeparators(tempZipPath));
+        env.insert("SK_DEST", QDir::toNativeSeparators(installDir));
 
-            if (exitCode == 0) {
-                log("Extraction successful.");
-                createShortcut(installDir);
-            } else {
-                log("Extraction failed. The zip file may be corrupted.");
-                btnInstall->setEnabled(true);
-                releaseCombo->setEnabled(true);
+        QProcess *process = new QProcess(this);
+        process->setProcessEnvironment(env);
+
+        connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, installDir, process](int exitCode, QProcess::ExitStatus) {
+            process->deleteLater();
+            QFile::remove(tempZipPath);
+
+            if (exitCode != 0) {
+                log("Extraction failed. If Sönkkökoodi is running, close it and try again; otherwise the zip may be corrupted.");
+                resetUi();
+                return;
             }
+
+            // The zip may contain a top-level folder; find the real executable.
+            QString exePath;
+            if (QFileInfo::exists(installDir + "/sonkkokoodi.exe")) {
+                exePath = installDir + "/sonkkokoodi.exe";
+            } else {
+                QDirIterator it(installDir, QStringList() << "sonkkokoodi.exe", QDir::Files, QDirIterator::Subdirectories);
+                if (it.hasNext()) exePath = it.next();
+            }
+            if (exePath.isEmpty()) {
+                log("Extraction finished, but sonkkokoodi.exe was not found in the package.");
+                resetUi();
+                return;
+            }
+
+            log("Extraction successful.");
+            createShortcut(exePath);
         });
 
-        process->start("powershell.exe", QStringList() << "-NoProfile" << "-Command" << psCommand);
+        process->start("powershell.exe", QStringList() << "-NoProfile" << "-Command"
+                       << "Expand-Archive -LiteralPath $env:SK_ZIP -DestinationPath $env:SK_DEST -Force");
     }
 
-    void createShortcut(const QString &installDir) {
+    void createShortcut(const QString &exePath) {
         log("Creating desktop shortcut...");
-        
-        // Ensure path points directly to the executable in the root of the install dir
-        QString exePath = installDir + "/sonkkokoodi.exe";
+
+        const QString installDir = QFileInfo(exePath).absolutePath();
         QString shortcutPath = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation) + "/Sönkkökoodi.lnk";
 
-        QString psCommand = QString("$wshell = New-Object -ComObject WScript.Shell; $s = $wshell.CreateShortcut('%1'); $s.TargetPath = '%2'; $s.WorkingDirectory = '%3'; $s.Save();")
-                            .arg(shortcutPath, exePath, installDir);
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert("SK_LNK", QDir::toNativeSeparators(shortcutPath));
+        env.insert("SK_EXE", QDir::toNativeSeparators(exePath));
+        env.insert("SK_DIR", QDir::toNativeSeparators(installDir));
 
         QProcess *process = new QProcess(this);
+        process->setProcessEnvironment(env);
         connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, process, exePath, installDir](int exitCode, QProcess::ExitStatus) {
             process->deleteLater();
             log("------------------------------------------");
-            log("Installation complete.");
-            log("You can now launch the app from your Desktop.");
-            
+            if (exitCode == 0) {
+                log("Installation complete.");
+                log("You can now launch the app from your Desktop.");
+            } else {
+                log("Installation complete, but the desktop shortcut could not be created.");
+                log("Launch the app from: " + QDir::toNativeSeparators(exePath));
+            }
+
             // --- UPDATED LOGIC: LAUNCH APP & EXIT ---
             btnInstall->setText("LAUNCH SÖNKKÖKOODI & EXIT");
             btnInstall->setEnabled(true);
@@ -312,12 +420,14 @@ private slots:
             });
         });
 
-        process->start("powershell.exe", QStringList() << "-NoProfile" << "-Command" << psCommand);
+        process->start("powershell.exe", QStringList() << "-NoProfile" << "-Command"
+                       << "$w = New-Object -ComObject WScript.Shell; $s = $w.CreateShortcut($env:SK_LNK); "
+                          "$s.TargetPath = $env:SK_EXE; $s.WorkingDirectory = $env:SK_DIR; $s.Save()");
     }
 
     void log(const QString &text) {
         QString timestamp = QDateTime::currentDateTime().toString("HH:mm:ss");
-        logDisplay->append("<span style='color:#777777;'>[" + timestamp + "]</span> <span style='color:#55FF55;'>" + text + "</span>");
+        logDisplay->append("<span style='color:#777777;'>[" + timestamp + "]</span> <span style='color:#55FF55;'>" + text.toHtmlEscaped() + "</span>");
     }
 
 private:
@@ -325,6 +435,8 @@ private:
     QNetworkReply *downloadReply;
     QFile *zipFile;
     QString tempZipPath;
+    QString expectedDigest;
+    bool writeFailed = false;
 
     QComboBox *releaseCombo;
     QProgressBar *progressBar;
