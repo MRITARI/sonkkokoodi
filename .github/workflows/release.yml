@@ -30,6 +30,7 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-qt6-base
+            mingw-w64-ucrt-x86_64-qt6-tools
             mingw-w64-ucrt-x86_64-openssl
             zip
 
@@ -41,10 +42,12 @@ jobs:
 
       - name: Package app
         run: |
+          DEPLOY=$(command -v windeployqt-qt6 || command -v windeployqt6 || command -v windeployqt)
+          echo "Using $DEPLOY"
           mkdir -p dist
           cp build/sonkkokoodi.exe dist/
           # Qt plugins + Qt DLLs
-          windeployqt-qt6 --no-translations --release dist/sonkkokoodi.exe
+          "$DEPLOY" --no-translations --release dist/sonkkokoodi.exe
           # Remaining runtime DLLs (OpenSSL, MinGW runtime, ...)
           ldd dist/sonkkokoodi.exe | awk '/ucrt64/ {print $3}' | xargs -r cp -n -t dist/
           (cd dist && zip -r ../Sonkkokoodi-${GITHUB_REF_NAME:-dev}-windows.zip .)
@@ -53,9 +56,10 @@ jobs:
         run: |
           # The installer itself needs Qt too; ship it self-contained in its own zip.
           # (The installer skips assets with "installer" in the name when picking the app zip.)
+          DEPLOY=$(command -v windeployqt-qt6 || command -v windeployqt6 || command -v windeployqt)
           mkdir -p installer_dist
           cp build/sonkkokoodi_installer.exe installer_dist/
-          windeployqt-qt6 --no-translations --release installer_dist/sonkkokoodi_installer.exe
+          "$DEPLOY" --no-translations --release installer_dist/sonkkokoodi_installer.exe
           ldd installer_dist/sonkkokoodi_installer.exe | awk '/ucrt64/ {print $3}' | xargs -r cp -n -t installer_dist/
           (cd installer_dist && zip -r ../Sonkkokoodi-Installer-${GITHUB_REF_NAME:-dev}.zip .)
 
