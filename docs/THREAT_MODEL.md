@@ -39,6 +39,26 @@ key. The vault stores decrypted history, so the on-disk history is only as safe 
 per-sender chain with fresh DH input (Double Ratchet / MLS style) would add recovery; that is a large
 redesign and is not proposed unless you want it.
 
-## What is and is not protected (for the README, after Phase 2 lands)
-Not yet written, because the claims depend on changes that are not made yet. Writing them now would
-over-promise.
+## What is and is not protected (protocol v2, as implemented)
+
+**Protected, and tested**
+- A stranger or the relay **cannot obtain the room key** without the room passphrase: HELLO and WELCOME carry MACs keyed from it, and the wrapping key also depends on it (`test_protocol` keyDeliveryEndToEnd, `test_chat` wrongPassphraseNeverReceivesTheKey).
+- Captured packets **cannot be replayed** to a connected peer (session id + counter + signed timestamp, 120 s window; `replayedPacketIsIgnored`).
+- Tampered ciphertext is rejected (AES-256-GCM; every byte flip tested in `test_crypto`).
+- Two clients joining at the same instant end up with one key (`forcedSimultaneousKeyCreationConverges`).
+
+**Protected by design, not tested end to end**
+- Vault, notes and identity key are encrypted at rest under a password-derived key (PBKDF2-HMAC-SHA256, 600k iterations for new installs). Strength is bounded by the password.
+- Identity pins use the full 256-bit key fingerprint.
+
+**NOT protected**
+- **Metadata**: the relay sees IPs, timing and message sizes. The transport is plain TCP.
+- **Anyone who knows the passphrase** is fully trusted and reads everything. No per-member revocation. A leaked passphrase lets an attacker join future sessions.
+- **Offline passphrase guessing**: a recorded HELLO lets an attacker test guesses (scrypt N=2^15 slows it). Use a long random passphrase.
+- **Forward secrecy is limited**: the key is hashed forward every 15 messages. Stealing the current key reveals all later messages; there is no post-compromise recovery. A new member receives the current key.
+- **Ratchet desync** (audit #6) is not fixed: a client that misses more than 16 epochs of messages stays out of sync until it reconnects.
+- **Memory / running machine**: only the vault key is wiped on lock. Identity key, room keys, group key and decrypted history remain in memory while locked.
+- **Replay beyond the window or across a restarted peer**: a packet older than 120 s is rejected, but a malicious relay can still delay or drop messages, and clocks must agree within ~2 minutes.
+- **Local attacker with disk access** can edit the unauthenticated settings file (e.g. add a pin).
+- **Supply chain**: the installer verifies GitHub's published SHA-256 and refuses without one, but the checksum is not signed, so a compromised GitHub account defeats it.
+- This is still unreviewed cryptography written by an LLM; see the README disclaimer.

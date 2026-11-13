@@ -25,7 +25,7 @@ find_package(OpenSSL REQUIRED)
 # 1. THE MAIN SECURE CHAT APPLICATION
 # ==============================================================================
 # Crypto primitives live in a GUI-free library so they can be unit tested.
-add_library(sk_crypto STATIC sk_crypto.cpp)
+add_library(sk_crypto STATIC sk_crypto.cpp sk_protocol.cpp)
 target_include_directories(sk_crypto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sk_crypto PUBLIC Qt6::Core OpenSSL::Crypto)
 
@@ -70,3 +70,16 @@ enable_testing()
 add_executable(test_crypto tests/test_crypto.cpp)
 target_link_libraries(test_crypto PRIVATE sk_crypto Qt6::Test)
 add_test(NAME crypto COMMAND test_crypto)
+
+add_executable(test_protocol tests/test_protocol.cpp)
+target_link_libraries(test_protocol PRIVATE sk_crypto Qt6::Test)
+add_test(NAME protocol COMMAND test_protocol)
+
+# End-to-end: real app instances (headless) against the real relay. Needs python on PATH (or SK_PYTHON).
+add_executable(test_chat tests/test_chat.cpp)
+target_compile_definitions(test_chat PRIVATE SK_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(test_chat PRIVATE ${CMAKE_BINARY_DIR}/sonkkokoodi_autogen/include)
+target_link_libraries(test_chat PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test OpenSSL::Crypto sk_crypto)
+add_dependencies(test_chat sonkkokoodi)
+add_test(NAME chat_e2e COMMAND test_chat)
+set_tests_properties(chat_e2e PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 600)

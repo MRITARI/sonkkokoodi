@@ -59,6 +59,7 @@
 #include <openssl/obj_mac.h>
 #include <openssl/crypto.h>
 #include "sk_crypto.h"
+#include "sk_protocol.h"
 
 // --- Limits ---
 static const qint64 kMaxLineBytes     = 16384;  // max size of one incoming network line
@@ -226,10 +227,14 @@ private:
 };
 
 // --- Main Application ---
+class ChatE2ETest;   // tests/test_chat.cpp drives the real class headlessly
+
 class SecureChatApp : public QMainWindow {
     Q_OBJECT
+    friend class ChatE2ETest;
 public:
-    SecureChatApp() {
+    // dataDirIn: where config/vault live. Empty = next to the executable (portable layout).
+    explicit SecureChatApp(const QString &dataDirIn = QString()) : dataDir(dataDirIn) {
         setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
         setAttribute(Qt::WA_TranslucentBackground);
         resize(1200, 800);
@@ -350,6 +355,10 @@ public:
     }
 
     ~SecureChatApp() {
+        if (qApp) qApp->removeEventFilter(this);
+        // Child widgets are destroyed in an unspecified order; make sure the socket can no longer call
+        // back into half-destroyed members (its 'disconnected' handler touches timers).
+        if (tcpSocket) { tcpSocket->disconnect(this); tcpSocket->abort(); tcpSocket = nullptr; }
         if (myIdentityKey) EVP_PKEY_free(myIdentityKey);
         if (myEphemeralKey) EVP_PKEY_free(myEphemeralKey);
     }
@@ -435,6 +444,7 @@ private slots:
         log("clear          : Clear the terminal display", "[ * ]", true);
         log("disconnect     : Disconnect from the current server", "[ * ]", true);
         log("connect        : Connect to the saved server", "[ * ]", true);
+        log("passphrase     : Set the room passphrase (must match everyone in the room)", "[ * ]", true);
         log("server <ip>    : Change the target server (ip or ip:port)", "[ * ]", true);
         log("port <num>     : Change the target server port", "[ * ]", true);
         log("help           : Show this list", "[ * ]", true);
@@ -791,6 +801,7 @@ private slots:
         legacyPem = settings.value("ecdsa_identity").toString();    // legacy plaintext key, migrated on first unlock
         identityEnc = settings.value("ecdsa_identity_enc").toByteArray();
         vaultSalt = settings.value("vault_salt").toByteArray();
+        roomEnc = settings.value("room_enc").toByteArray();
         kdfIterations = settings.value("kdf_iter", sk::kLegacyPbkdf2Iterations).toInt();   // absent = pre-existing install
 
         notifyConnect = settings.value("notify_connect", true).toBool();
@@ -1016,6 +1027,13 @@ private slots:
 
         if (autoLockMinutes > 0) autoLockTimer->start();
 
+        if (!roomKeys.valid()) loadRoomKeys();
+        if (!roomKeys.valid()) {            // new install, or an install from before protocol v2
+            refreshChatDisplay();
+            beginRoomPassphraseStep();
+            return;
+        }
+
         if (tcpSocket && tcpSocket->state() == QAbstractSocket::ConnectedState) {
             promptLabel->setText("chat >");
         } else {
@@ -1023,6 +1041,64 @@ private slots:
             if (!userDisconnected) connectToPeer();
         }
         refreshChatDisplay();
+    }
+
+    bool loadRoomKeys() {
+        roomKeys.wipe();
+        if (roomEnc.size() <= 12 || vaultKey.isEmpty()) return false;
+        bool ok = false;
+        QByteArray plain = decryptGCM(roomEnc.mid(12), vaultKey, roomEnc.left(12), &ok);
+        if (!ok || plain.size() != 64) return false;
+        roomKeys.auth = plain.left(32);
+        roomKeys.wrap = plain.mid(32, 32);
+        plain.fill(0);
+        return roomKeys.valid();
+    }
+
+    void beginRoomPassphraseStep() {
+        setupStep = 4;
+        msgInput->clear();
+        msgInput->setEchoMode(QLineEdit::Password);
+        msgInput->setPlaceholderText("ROOM PASSPHRASE (shared out-of-band with the people you chat with)...");
+        promptLabel->setText("room >");
+        msgInput->setFocus();
+        log("Room passphrase: everyone in the room must enter the SAME passphrase. It authenticates the key exchange, so the relay or a stranger cannot obtain the room key. Use 12+ characters.", "[ * ]", true);
+    }
+
+    void handleRoomPassphrase(const QString &pass) {
+        msgInput->clear();
+        if (pass.size() < 8) {
+            log("Passphrase too short (minimum 8 characters, 12+ recommended).", "[ ! ]", true);
+            return;
+        }
+        static const char *hints[] = { "weak", "fair", "good", "strong" };
+        log(QString("Passphrase strength: %1 (length/variety estimate only).").arg(hints[sk::passphraseStrength(pass)]), "[ * ]", true);
+        sk::RoomKeys rk = sk::deriveRoomKeys(pass);
+        if (!rk.valid()) { log("Key derivation failed. Please try again.", "[ ! ]", true); return; }
+        QByteArray packed = rk.auth + rk.wrap;
+        QByteArray iv;
+        QByteArray c = encryptGCM(packed, vaultKey, iv);
+        packed.fill(0);
+        if (c.isEmpty()) { rk.wipe(); log("Could not store the room key.", "[ ! ]", true); return; }
+        roomEnc = iv + c;
+        QSettings(iniPath(), QSettings::IniFormat).setValue("room_enc", roomEnc);
+        roomKeys.wipe();
+        roomKeys = rk;
+
+        msgInput->setEchoMode(QLineEdit::Normal);
+        msgInput->setPlaceholderText("");
+        setupStep = 0;
+        log("Room passphrase saved.", "[ * ]", true);
+        const bool reconnect = roomChangeRequested;
+        roomChangeRequested = false;
+        if (reconnect) {
+            userDisconnected = false;
+            dropSocket(QString());
+            promptLabel->setText(">");
+            connectToPeer();
+        } else {
+            unlockSystem();
+        }
     }
 
     bool storeIdentity(const QByteArray &pem) {
@@ -1080,6 +1156,7 @@ private slots:
     }
 
     void handleInput() {
+        if (setupStep == 4) { if (!msgInput->text().isEmpty()) handleRoomPassphrase(msgInput->text()); return; }
         QString text = msgInput->text().trimmed();
         if (text.isEmpty()) return;
         msgInput->clear();
@@ -1124,7 +1201,7 @@ private slots:
             targetIp = ip;
             targetPort = port;
 
-            enableAutoStart(autoStart);
+            if (autoStart) enableAutoStart(true);
             setupStep = 0;
             unlockSystem();
             return;
@@ -1139,6 +1216,10 @@ private slots:
             return;
         } else if (lowerText == "help") {
             printHelp();
+            return;
+        } else if (lowerText == "passphrase") {
+            roomChangeRequested = true;
+            beginRoomPassphraseStep();
             return;
         } else if (lowerText == "disconnect") {
             userDisconnected = true;
@@ -1263,6 +1344,9 @@ private slots:
 
         connect(sock, &QTcpSocket::connected, this, [this, sock]() {
             if (sock != tcpSocket) return;
+            mySid.resize(8);
+            if (RAND_bytes((unsigned char*)mySid.data(), 8) != 1) { dropSocket("Secure random generator failed."); return; }
+            sendCtr = 0;
             promptLabel->setText("chat >");
             startKeyNegotiation();
         });
@@ -1331,8 +1415,9 @@ private slots:
 
 private:
 
-    QString iniPath() const { return QCoreApplication::applicationDirPath() + "/sonkkokoodi.ini"; }
-    QString dataPath(const QString &name) const { return QCoreApplication::applicationDirPath() + "/" + name; }
+    QString baseDir() const { return dataDir.isEmpty() ? QCoreApplication::applicationDirPath() : dataDir; }
+    QString iniPath() const { return baseDir() + "/sonkkokoodi.ini"; }
+    QString dataPath(const QString &name) const { return baseDir() + "/" + name; }
 
     // Empty result = failure; callers must abort rather than continue with a weak key.
     QByteArray derivePBKDF2(const QString &pwd, const QByteArray &salt, int iterations) {
@@ -1442,7 +1527,13 @@ private:
 
     void sendSignedPacket(const QJsonObject &payload) {
         if (!tcpSocket) return;
-        QByteArray data = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        // Protocol v2: every signed payload carries version, session id, counter and timestamp (replay protection).
+        QJsonObject stamped = payload;
+        stamped["v"] = sk::kProtocolVersion;
+        stamped["sid"] = QString(mySid.toBase64());
+        stamped["ctr"] = QString::number(++sendCtr);
+        stamped["ts"] = QString::number(QDateTime::currentMSecsSinceEpoch());
+        QByteArray data = QJsonDocument(stamped).toJson(QJsonDocument::Compact);
         QByteArray sig = signData(data);
         if (sig.isEmpty()) return;
 
@@ -1472,6 +1563,7 @@ private:
     }
 
     void startKeyNegotiation() {
+        if (!roomKeys.valid()) { dropSocket("No room passphrase set. Type 'passphrase' to set one."); return; }
         isNegotiating = true;
         selfGeneratedKey = false;
         pendingHellos.clear();
@@ -1487,14 +1579,20 @@ private:
         QJsonObject helloObj;
         helloObj["type"] = "HELLO";
         helloObj["nick"] = myNickname;
-        helloObj["ecdh_pub"] = QString(pkeyToDER(myEphemeralKey).toBase64());
+        const QByteArray myEcdhDer = pkeyToDER(myEphemeralKey);
+        myHelloNonce.resize(16);
+        if (RAND_bytes((unsigned char*)myHelloNonce.data(), 16) != 1) { dropSocket("Secure random generator failed."); return; }
+        helloObj["ecdh_pub"] = QString(myEcdhDer.toBase64());
+        helloObj["nonce"] = QString(myHelloNonce.toBase64());
+        helloObj["mac"] = QString(sk::helloMac(roomKeys, myEcdhDer, myHelloNonce, pkeyToDER(myIdentityKey)).toBase64());
         sendSignedPacket(helloObj);
 
         // Randomised timeout so that two peers joining an empty room at the same moment do not
         // both give up simultaneously: the first one to time out creates the key and then answers
         // the HELLOs it queued from the other.
         const int token = ++negotiationToken;
-        const int timeoutMs = 2500 + int(QRandomGenerator::global()->bounded(2000));
+        const int timeoutMs = negotiationTimeoutOverrideMs >= 0 ? negotiationTimeoutOverrideMs
+                                                                 : 2500 + int(QRandomGenerator::global()->bounded(2000));
         QTimer::singleShot(timeoutMs, this, [this, token]() {
             if (token != negotiationToken || !isNegotiating) return;
             isNegotiating = false;
@@ -1510,45 +1608,62 @@ private:
             reconnectDelaySec = 2;
                 showLoadingScreen("[*] SECURE TUNNEL ESTABLISHED", 1000);
 
-            const QList<QByteArray> queued = pendingHellos;
+            const QList<PendingHello> queued = pendingHellos;
             pendingHellos.clear();
-            for (const QByteArray &der : queued) scheduleWelcome(der);
+            for (const PendingHello &h : queued) scheduleWelcome(h.der, h.nonce);
         });
     }
 
-    void scheduleWelcome(const QByteArray &targetEcdhDer) {
-        QTimer::singleShot(int(QRandomGenerator::global()->bounded(300)) + 50, this, [this, targetEcdhDer]() {
-            sendWelcome(targetEcdhDer);
+    void scheduleWelcome(const QByteArray &targetEcdhDer, const QByteArray &joinerNonce) {
+        QTimer::singleShot(int(QRandomGenerator::global()->bounded(300)) + 50, this, [this, targetEcdhDer, joinerNonce]() {
+            sendWelcome(targetEcdhDer, joinerNonce);
         });
     }
 
-    void sendWelcome(const QByteArray &targetEcdhDer) {
-        if (!tcpSocket || currentGroupKey.isEmpty() || isNegotiating) return;
+    void sendWelcome(const QByteArray &targetEcdhDer, const QByteArray &joinerNonce) {
+        if (!tcpSocket || currentGroupKey.isEmpty() || isNegotiating || !roomKeys.valid()) return;
 
         EVP_PKEY *peerEcdh = derToPkey(targetEcdhDer);
         if (!peerEcdh) return;
         EVP_PKEY *tempEcdh = generateEphemeralKey();
         if (!tempEcdh) { EVP_PKEY_free(peerEcdh); return; }
 
-        QByteArray kek = deriveSharedSecret(tempEcdh, peerEcdh);
+        const QByteArray tempDer = pkeyToDER(tempEcdh);
+        QByteArray secret = deriveSharedSecret(tempEcdh, peerEcdh);
         EVP_PKEY_free(peerEcdh);
-        if (kek.isEmpty()) { EVP_PKEY_free(tempEcdh); return; }
+        EVP_PKEY_free(tempEcdh);
+        if (secret.isEmpty()) return;
+        // The wrapping key depends on the ephemeral ECDH secret AND the room secret.
+        QByteArray kek = sk::welcomeKek(roomKeys, secret, targetEcdhDer, tempDer, joinerNonce);
+        secret.fill(0);
+        if (kek.isEmpty()) return;
 
         QByteArray iv;
         QByteArray encKey = encryptGCM(currentGroupKey, kek, iv);
-        if (encKey.isEmpty()) { EVP_PKEY_free(tempEcdh); return; }
+        kek.fill(0);
+        if (encKey.isEmpty()) return;
+
+        sk::WelcomeFields f;
+        f.target = QCryptographicHash::hash(targetEcdhDer, QCryptographicHash::Sha256).toHex();
+        f.welcomerEcdhPub = tempDer;
+        f.iv = iv;
+        f.encKey = encKey;
+        f.joinerNonce = joinerNonce;
+        f.senderPub = pkeyToDER(myIdentityKey);
+        f.epoch = keyEpoch;
+        f.msgCount = msgCount;
 
         QJsonObject welcomeObj;
         welcomeObj["type"] = "WELCOME";
-        welcomeObj["target"] = QString(QCryptographicHash::hash(targetEcdhDer, QCryptographicHash::Sha256).toHex());
-        welcomeObj["ecdh_pub"] = QString(pkeyToDER(tempEcdh).toBase64());
+        welcomeObj["target"] = QString::fromLatin1(f.target);
+        welcomeObj["ecdh_pub"] = QString(tempDer.toBase64());
         welcomeObj["iv"] = QString(iv.toBase64());
         welcomeObj["enc_key"] = QString(encKey.toBase64());
+        welcomeObj["nonce"] = QString(joinerNonce.toBase64());
         welcomeObj["msg_count"] = msgCount;
         welcomeObj["epoch"] = keyEpoch;
-
+        welcomeObj["mac"] = QString(sk::welcomeMac(roomKeys, f).toBase64());
         sendSignedPacket(welcomeObj);
-        EVP_PKEY_free(tempEcdh);
     }
 
     // --- Incoming data --------------------------------------------------------------------
@@ -1569,6 +1684,14 @@ private:
         QSettings settings(iniPath(), QSettings::IniFormat);
         settings.remove("TrustedIdentities/" + legacy);
         settings.setValue("TrustedIdentities/" + fp, nick);
+    }
+
+    // Rate-limited notice (at most one per 30 s) so a hostile peer cannot flood the log.
+    void noteIgnored(const QString &msg) {
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (now - lastIgnoredLogMs < 30000) return;
+        lastIgnoredLogMs = now;
+        log(msg, "[ ! ]", true);
     }
 
     QString displayNameFor(const QString &uid, const QJsonValue &claimedNick) {
@@ -1622,13 +1745,33 @@ private:
             QJsonObject payload = QJsonDocument::fromJson(dataBytes).object();
             QString type = payload["type"].toString();
 
+            // --- Protocol v2 gate: version, session id, counter, timestamp ---
+            bool okNum1 = false, okNum2 = false;
+            const quint64 pktCtr = payload["ctr"].toString().toULongLong(&okNum1);
+            const qint64 pktTs = payload["ts"].toString().toLongLong(&okNum2);
+            const QByteArray pktSid = QByteArray::fromBase64(payload["sid"].toString().toUtf8());
+            if (payload["v"].toInt(0) != sk::kProtocolVersion || !okNum1 || !okNum2) {
+                noteIgnored("A client running an older, incompatible version is in the room (its packets are ignored).");
+                continue;
+            }
+            if (replayGuard.check(senderUid, pktSid, pktCtr, pktTs, QDateTime::currentMSecsSinceEpoch()) != sk::ReplayGuard::Ok) continue;
+
             if (type == "HELLO") {
                 QByteArray targetEcdhDer = QByteArray::fromBase64(payload["ecdh_pub"].toString().toUtf8());
+                QByteArray nonce = QByteArray::fromBase64(payload["nonce"].toString().toUtf8());
+                QByteArray mac = QByteArray::fromBase64(payload["mac"].toString().toUtf8());
                 if (targetEcdhDer.isEmpty() || targetEcdhDer.size() > 1024) continue;
+                // Only someone who knows the room passphrase can solicit the group key.
+                if (!sk::verifyHelloMac(roomKeys, targetEcdhDer, nonce, pubBytes, mac)) {
+                    noteIgnored("Ignored a join request that did not prove knowledge of the room passphrase (ID " + shortId(senderUid) + ").");
+                    continue;
+                }
 
                 if (isNegotiating) {
                     // We have no key yet; answer once we do (see startKeyNegotiation).
-                    if (pendingHellos.size() < 16 && !pendingHellos.contains(targetEcdhDer)) pendingHellos.append(targetEcdhDer);
+                    bool dup = false;
+                    for (const PendingHello &h : pendingHellos) if (h.der == targetEcdhDer) dup = true;
+                    if (pendingHellos.size() < 16 && !dup) pendingHellos.append({targetEcdhDer, nonce});
                     continue;
                 }
                 if (currentGroupKey.isEmpty()) continue;
@@ -1638,9 +1781,13 @@ private:
                 if (notifyConnect) {
                     sendNativeNotification("Connection", joinNick + " is joining the room.");
                 }
-                scheduleWelcome(targetEcdhDer);
+                scheduleWelcome(targetEcdhDer, nonce);
             }
-            else if (type == "WELCOME" && (isNegotiating || selfGeneratedKey) && myEphemeralKey) {
+            else if (type == "WELCOME" && (isNegotiating || selfGeneratedKey) && myEphemeralKey && roomKeys.valid()) {
+                // Two peers that both created a key (simultaneous join) converge on the lower fingerprint's key.
+                if (!isNegotiating && !sk::adoptWelcomeWhileSelfKeyed(myUid, senderUid)) continue;
+                if (QByteArray::fromBase64(payload["nonce"].toString().toUtf8()) != myHelloNonce) continue;   // not an answer to OUR hello
+
                 QByteArray myEcdhDer = pkeyToDER(myEphemeralKey);
                 QString myHash = QString(QCryptographicHash::hash(myEcdhDer, QCryptographicHash::Sha256).toHex());
 
@@ -1653,14 +1800,33 @@ private:
                 QByteArray peerEcdhDer = QByteArray::fromBase64(payload["ecdh_pub"].toString().toUtf8());
                 EVP_PKEY *peerEcdh = derToPkey(peerEcdhDer);
                 if (!peerEcdh) continue;
-                QByteArray kek = deriveSharedSecret(myEphemeralKey, peerEcdh);
+                QByteArray secret = deriveSharedSecret(myEphemeralKey, peerEcdh);
                 EVP_PKEY_free(peerEcdh);
-                if (kek.isEmpty()) continue;
+                if (secret.isEmpty()) continue;
 
                 QByteArray iv = QByteArray::fromBase64(payload["iv"].toString().toUtf8());
                 QByteArray encKey = QByteArray::fromBase64(payload["enc_key"].toString().toUtf8());
+
+                // Authenticate BEFORE decrypting: only a passphrase holder can produce this MAC.
+                sk::WelcomeFields wf;
+                wf.target = payload["target"].toString().toLatin1();
+                wf.welcomerEcdhPub = peerEcdhDer;
+                wf.iv = iv;
+                wf.encKey = encKey;
+                wf.joinerNonce = myHelloNonce;
+                wf.senderPub = pubBytes;
+                wf.epoch = epoch;
+                wf.msgCount = count;
+                if (!sk::verifyWelcomeMac(roomKeys, wf, QByteArray::fromBase64(payload["mac"].toString().toUtf8()))) {
+                    noteIgnored("Rejected a key delivery that failed room authentication (ID " + shortId(senderUid) + ").");
+                    continue;
+                }
+                QByteArray kek = sk::welcomeKek(roomKeys, secret, myEcdhDer, peerEcdhDer, myHelloNonce);
+                secret.fill(0);
+                if (kek.isEmpty()) continue;
                 bool ok = false;
                 QByteArray decKey = decryptGCM(encKey, kek, iv, &ok);
+                kek.fill(0);
                 if (!ok || decKey.size() != 32) continue;
 
                 // The key is only as trustworthy as whoever delivered it - make that visible.
@@ -1936,7 +2102,16 @@ private:
     bool selfGeneratedKey = false;
     int negotiationToken = 0;
     int connectToken = 0;
-    QList<QByteArray> pendingHellos;
+    struct PendingHello { QByteArray der; QByteArray nonce; };
+    QList<PendingHello> pendingHellos;
+    sk::RoomKeys roomKeys;
+    QByteArray roomEnc;
+    QByteArray myHelloNonce;
+    QByteArray mySid;
+    quint64 sendCtr = 0;
+    sk::ReplayGuard replayGuard;
+    qint64 lastIgnoredLogMs = 0;
+    bool roomChangeRequested = false;
     QSet<QByteArray> seenSigs;
     QList<QByteArray> seenOrder;
 
@@ -1956,6 +2131,8 @@ private:
     bool uninstalling = false;
     int failedAttempts = 0;
 
+    QString dataDir;
+    int negotiationTimeoutOverrideMs = -1;   // tests only: removes the random jitter to force collisions
     QString targetIp;
     int targetPort = 9999;
     QList<ChatMsg> history;
