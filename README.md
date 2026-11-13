@@ -14,7 +14,7 @@ Sönkkökoodi is a small Qt6 desktop chat client that talks through a "blind" Py
 * **End-to-end encryption.** AES-256-GCM with a room key that is hashed forward every 15 messages.
 * **Signed packets.** Every packet is signed with a persistent P-256 identity key. Packets carry a session id, counter and timestamp; replays are rejected.
 * **Trust on first use.** The first identity seen with an alias is remembered by its full 256-bit fingerprint. A different identity using that alias gets a persistent warning banner and an "IMPERSONATION" label. Look-alike aliases (Cyrillic/Greek homoglyphs, `0`/`o`, `1`/`l`/`i`, accents) count as the same name.
-* **Local vault.** History, notes and the identity key are encrypted on disk with a key derived from your password (PBKDF2-HMAC-SHA256, 600,000 iterations for new installs). Locking clears decrypted history from the window and from memory and zeroes the vault key.
+* **Local vault.** History, notes and the identity key are encrypted on disk with a key derived from your password (PBKDF2-HMAC-SHA256, 600,000 iterations for new installs). Locking removes decrypted history from the window and the history list and zeroes the vault key (freed memory is not scrubbed, so a memory dump can still find it).
 * **Always-visible state.** The status chip names the state in words and a glyph: Disconnected, Connecting, Negotiating keys, Secure, Locked. The client reconnects automatically with back-off.
 * **Accessible by default.** One dark theme with a single accent colour; every text/background pair is tested for at least 4.5:1 contrast; text size is adjustable in Settings; state is never carried by colour alone.
 * **Installer** that downloads the latest release and verifies it (see "Release signing").
@@ -31,7 +31,7 @@ The full model is in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md). In short:
 * **Anyone who knows the room passphrase** reads everything and can join future sessions. There is no per-member revocation.
 * **Weak passphrases**: a recorded join message lets an attacker test guesses offline.
 * **Forward secrecy is limited**: a stolen current room key reveals all later messages (no post-compromise recovery).
-* **Memory or a running machine**: only the vault key and decrypted history are cleared on lock; the identity and room keys stay in memory.
+* **Memory or a running machine**: on lock only the vault key is zeroed and the history is dropped (not scrubbed); the identity and room keys stay in memory.
 * **Updates**: until you set up release signing, the installer trusts GitHub's own checksum.
 
 ## Repository structure
