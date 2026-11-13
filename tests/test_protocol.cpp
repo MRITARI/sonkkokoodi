@@ -1,6 +1,7 @@
 #include <QtTest>
 #include "sk_protocol.h"
 #include "sk_crypto.h"
+#include "sk_validate.h"
 
 using namespace sk;
 
@@ -136,6 +137,38 @@ private slots:
         for (int i = 0; i < 100; ++i)
             QCOMPARE(g.check(QString::number(i), QByteArray(8, 'x'), 1, 10, 10), ReplayGuard::Ok);
         QVERIFY(g.sessionCount() <= 8);
+    }
+    void nickValidation() {
+        QVERIFY(isValidNick("alice"));
+        QVERIFY(isValidNick("a_b-c.d9"));
+        QVERIFY(!isValidNick(""));
+        QVERIFY(!isValidNick(QString(25, 'a')));
+        QVERIFY(!isValidNick("a b"));
+        QVERIFY(!isValidNick("<script>"));
+        QVERIFY(!isValidNick("a>b"));
+        QVERIFY(!isValidNick(QString("a") + QChar(0x202E) + "b"));   // right-to-left override
+    }
+    void lookalikeNicksShareASkeleton() {
+        const QString cyrillicA = QString(QChar(0x0430)) + "lice";
+        QCOMPARE(normNick("alice"), normNick(cyrillicA));            // Cyrillic homoglyph
+        QCOMPARE(normNick("Alice"), normNick("alice"));
+        QCOMPARE(normNick("a.l-i_ce"), normNick("alice"));           // punctuation
+        QCOMPARE(normNick("al1ce"), normNick("alice"));              // 1 / l / i
+        QCOMPARE(normNick("b0b"), normNick("bob"));                  // 0 / o
+        QCOMPARE(normNick(QString("Mik") + QChar(0x00E4)), normNick("Mika"));   // diacritics
+        QVERIFY(normNick("alice") != normNick("alicia"));
+        QVERIFY(normNick("bob") != normNick("rob"));
+    }
+    void endpointParsing() {
+        QString h; int p = 0; bool g = false;
+        QVERIFY(parseEndpoint("example.org", h, p, g) && h == "example.org" && !g);
+        QVERIFY(parseEndpoint(" example.org:1234 ", h, p, g) && p == 1234 && g);
+        QVERIFY(!parseEndpoint("", h, p, g));
+        QVERIFY(!parseEndpoint("host:0", h, p, g));
+        QVERIFY(!parseEndpoint("host:65536", h, p, g));
+        QVERIFY(!parseEndpoint("host:abc", h, p, g));
+        QVERIFY(!parseEndpoint("a b", h, p, g));
+        QVERIFY(!parseEndpoint(":99", h, p, g));
     }
     void strengthHint() {
         QCOMPARE(passphraseStrength("short"), 0);

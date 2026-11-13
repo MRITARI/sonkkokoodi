@@ -80,11 +80,9 @@ class ChatE2ETest : public QObject {
         const QString dir = tmp.path() + "/" + name;
         QDir().mkpath(dir);
         auto app = std::make_unique<SecureChatApp>(dir);
-        app->pwdInput->setText("unlock-password-1");  app->handlePwdSubmit();   // step 1
-        app->msgInput->setText(alias);                app->handleInput();       // step 2
-        app->msgInput->setText("127.0.0.1:" + QString::number(port)); app->handleInput();   // step 3
-        app->negotiationTimeoutOverrideMs = negotiationMs;
-        app->msgInput->setText(room);                 app->handleInput();       // step 4 -> connects
+        QString err;
+        const bool ok = app->applySetup("unlock-password-1", alias, "127.0.0.1:" + QString::number(port), room, &err, negotiationMs);
+        if (!ok) qWarning() << "setup failed:" << err;
         return app;
     }
     static bool secure(SecureChatApp *a) {
@@ -209,6 +207,121 @@ private slots:
         say(b.get(), "reply-after-burst");
         QTRY_VERIFY_WITH_TIMEOUT(saw(a.get(), "reply-after-burst"), 5000);
         QCOMPARE(a->keyEpoch, b->keyEpoch);
+    }
+
+    // Staggered start: B joins after A has sent its HELLO but self-keys BEFORE A does. B therefore never sees
+    // A's HELLO, and A's WELCOME may arrive at a self-keyed B. Whichever fingerprint is lower, both must
+    // still end up with the same key. Several rounds so both fingerprint orders occur.
+    void staggeredJoinConverges() {
+        stopRelay();
+        port = freePort();
+        startRelay();
+        for (int round = 0; round < 6; ++round) {
+            auto a = makeApp(QString("ga%1").arg(round), "stag-a", "staggered join passphrase", 3000);
+            QTest::qWait(400);
+            auto b = makeApp(QString("gb%1").arg(round), "stag-b", "staggered join passphrase", 1000);
+            QTRY_VERIFY_WITH_TIMEOUT(secure(a.get()) && secure(b.get()), 20000);
+            QTRY_VERIFY2_WITH_TIMEOUT(a->currentGroupKey == b->currentGroupKey,
+                                      qPrintable(QString("round %1: split room").arg(round)), 40000);
+            say(a.get(), "ping-a");
+            QTRY_VERIFY_WITH_TIMEOUT(saw(b.get(), "ping-a"), 4000);
+            a.reset(); b.reset();
+            QTest::qWait(300);
+        }
+    }
+
+    // The always-visible status chip must name every state in words (and glyphs), not only by color.
+    void statusChipNamesEveryState() {
+        stopRelay();
+        port = freePort();
+        startRelay();
+        auto a = makeApp("st", "status-a", "status chip passphrase");
+        a->show();
+        QTRY_VERIFY_WITH_TIMEOUT(a->statusText().contains("Negotiating") || a->statusText().contains("Connecting"), 4000);
+        QTRY_VERIFY_WITH_TIMEOUT(a->statusText().contains("Secure"), 15000);
+        QCOMPARE(a->statusLabel->property("state").toString(), QString("secure"));
+
+        a->lockSystem();
+        QTRY_VERIFY_WITH_TIMEOUT(a->statusText().contains("Locked"), 2000);
+        a->pwdInput->setText("unlock-password-1");
+        a->handlePwdSubmit();
+        QTRY_VERIFY_WITH_TIMEOUT(a->statusText().contains("Secure"), 4000);
+
+        stopRelay();
+        QTRY_VERIFY_WITH_TIMEOUT(a->statusText().contains("Reconnecting") || a->statusText().contains("Disconnected"), 6000);
+        QVERIFY(!a->statusText().contains("Secure"));
+        say(a.get(), "disconnect");
+        QTRY_VERIFY_WITH_TIMEOUT(a->statusText().contains("Disconnected"), 4000);
+        startRelay();
+    }
+
+    void lockWipesPlaintextAndWrongPasswordIsRejected() {
+        stopRelay();
+        port = freePort();
+        startRelay();
+        auto a = makeApp("lk", "lock-a", "lock test passphrase");
+        a->show();
+        QTRY_VERIFY_WITH_TIMEOUT(secure(a.get()), 15000);
+        auto b = makeApp("lkb", "lock-b", "lock test passphrase");
+        QTRY_VERIFY_WITH_TIMEOUT(secure(b.get()), 15000);
+        say(a.get(), "secret-before-lock");
+        QTRY_VERIFY_WITH_TIMEOUT(saw(b.get(), "secret-before-lock"), 3000);
+
+        a->lockSystem();
+        QVERIFY(a->isLocked);
+        QCOMPARE(a->mainStack->currentIndex(), 1);
+        // nothing decrypted remains in the widget, the history list, or the vault key
+        QVERIFY(a->chatDisplay->toPlainText().isEmpty());
+        QVERIFY(a->history.isEmpty());
+        for (char c : a->vaultKey) QVERIFY(c == 0);
+
+        // a message arriving while locked is kept and shown after unlock
+        say(b.get(), "arrived-while-locked");
+        QTRY_VERIFY_WITH_TIMEOUT(saw(a.get(), "arrived-while-locked"), 4000);
+        QVERIFY(a->chatDisplay->toPlainText().isEmpty());        // still not drawn
+
+        a->pwdInput->setText("wrong password");
+        a->handlePwdSubmit();
+        QVERIFY(a->isLocked);
+        QVERIFY(a->lockError->text().contains("Wrong password"));
+        QVERIFY(!a->pwdInput->isEnabled());                      // back-off in effect
+        QTRY_VERIFY_WITH_TIMEOUT(a->pwdInput->isEnabled(), 3000);
+
+        a->pwdInput->setText("unlock-password-1");
+        a->handlePwdSubmit();
+        QVERIFY(!a->isLocked);
+        QCOMPARE(a->mainStack->currentIndex(), 0);
+        QVERIFY(saw(a.get(), "secret-before-lock"));             // restored from the vault
+        QVERIFY(saw(a.get(), "arrived-while-locked"));
+        QVERIFY(a->chatDisplay->toPlainText().contains("secret-before-lock"));
+        QTRY_VERIFY_WITH_TIMEOUT(secure(a.get()), 4000);
+    }
+
+    void lockedAppStillReadsAfterRestartWithTheSameVault() {
+        // Persistence: a second instance on the same data dir unlocks with the password and sees the history.
+        const QString dir = tmp.path() + "/lk";
+        {
+            SecureChatApp again(dir);
+            QVERIFY(again.setupStep == 0);                       // setup was completed
+            again.pwdInput->setText("unlock-password-1");
+            again.handlePwdSubmit();
+            QVERIFY(!again.isLocked);
+            QVERIFY(saw(&again, "secret-before-lock"));
+            QVERIFY(again.roomKeys.valid());
+        }
+    }
+
+    void lockScreenTextIsNotClipped() {
+        auto a = makeApp("lc", "clip-a", "clip test passphrase");
+        a->show();
+        a->lockSystem();
+        a->pwdInput->setText("wrong");
+        a->handlePwdSubmit();
+        QTest::qWait(100);
+        for (QLabel *l : a->findChildren<QLabel *>()) {
+            if (!l->wordWrap() || l->text().isEmpty() || !l->isVisible()) continue;
+            QVERIFY2(l->height() >= l->heightForWidth(l->width()), qPrintable("clipped: " + l->text().left(30)));
+        }
     }
 
     void relayKilledThenAutoReconnect() {

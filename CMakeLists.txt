@@ -84,3 +84,28 @@ target_link_libraries(test_chat PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Net
 add_dependencies(test_chat sonkkokoodi)
 add_test(NAME chat_e2e COMMAND test_chat)
 set_tests_properties(chat_e2e PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 600)
+
+# Renders every screen headlessly into PNGs (docs/screenshots). Not part of the default test run.
+add_executable(screenshots_app EXCLUDE_FROM_ALL tools/screenshots_app.cpp)
+target_include_directories(screenshots_app PRIVATE ${CMAKE_BINARY_DIR}/sonkkokoodi_autogen/include)
+target_link_libraries(screenshots_app PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network OpenSSL::Crypto sk_crypto)
+add_dependencies(screenshots_app sonkkokoodi)
+
+add_executable(test_theme tests/test_theme.cpp)
+target_include_directories(test_theme PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_theme PRIVATE Qt6::Gui Qt6::Test)
+add_test(NAME theme COMMAND test_theme)
+set_tests_properties(theme PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_dialogs tests/test_dialogs.cpp)
+target_include_directories(test_dialogs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_dialogs PRIVATE Qt6::Widgets Qt6::Test sk_crypto)
+add_test(NAME dialogs COMMAND test_dialogs)
+set_tests_properties(dialogs PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+if(WIN32)
+    add_executable(screenshots_installer EXCLUDE_FROM_ALL tools/screenshots_installer.cpp)
+    target_include_directories(screenshots_installer PRIVATE ${CMAKE_BINARY_DIR}/sonkkokoodi_installer_autogen/include)
+    target_link_libraries(screenshots_installer PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network sk_crypto)
+    add_dependencies(screenshots_installer sonkkokoodi_installer)
+endif()

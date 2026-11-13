@@ -48,6 +48,10 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QPointer>
+#include <QMenuBar>
+#include <QStatusBar>
+#include <QMessageBox>
+#include <QFrame>
 
 #include <memory>
 
@@ -60,6 +64,9 @@
 #include <openssl/crypto.h>
 #include "sk_crypto.h"
 #include "sk_protocol.h"
+#include "sk_validate.h"
+#include "theme.h"
+#include "sk_dialogs.h"
 
 // --- Limits ---
 static const qint64 kMaxLineBytes     = 16384;  // max size of one incoming network line
@@ -93,247 +100,145 @@ static QByteArray makeVerifier(const QByteArray &vaultKey) {
     return QCryptographicHash::hash(QByteArray("sk-verify-v1") + vaultKey, QCryptographicHash::Sha256).toHex();
 }
 
-// --- Alias helpers ---
-static bool isValidNick(const QString &n) {
-    if (n.isEmpty() || n.size() > 24) return false;
-    for (QChar c : n) {
-        if (!(c.isLetterOrNumber() || c == QLatin1Char('_') || c == QLatin1Char('-') || c == QLatin1Char('.')))
-            return false;
-    }
-    return true;
-}
-
-// Case/punctuation-insensitive form used to detect look-alike aliases.
-static QString normNick(const QString &n) {
-    QString out;
-    for (QChar c : n) if (c.isLetterOrNumber()) out += c.toCaseFolded();
-    return out;
-}
-
-// "host" or "host:port". portGiven tells whether a port was part of the text.
-static bool parseEndpoint(const QString &text, QString &host, int &port, bool &portGiven) {
-    QString t = text.trimmed();
-    portGiven = false;
-    if (t.isEmpty() || t.contains(QLatin1Char(' '))) return false;
-    if (t.count(QLatin1Char(':')) == 1) {
-        int i = t.indexOf(QLatin1Char(':'));
-        bool ok = false;
-        int p = t.mid(i + 1).toInt(&ok);
-        if (!ok || p < 1 || p > 65535) return false;
-        host = t.left(i);
-        port = p;
-        portGiven = true;
-    } else {
-        host = t;
-    }
-    return !host.isEmpty();
-}
-
 // --- UI Components ---
-class TechTopBar : public QWidget {
-    Q_OBJECT
-public:
-    TechTopBar(QWidget *parent = nullptr) : QWidget(parent), m_parent(parent) {
-        setFixedHeight(45);
-        QHBoxLayout *layout = new QHBoxLayout(this);
-        layout->setContentsMargins(20, 0, 20, 0);
-
-        QLabel *title = new QLabel("SÖNKKÖKOODI", this);
-        title->setStyleSheet("color: #55FF55; font-weight: bold; font-family: 'Arial'; font-size: 16px;");
-        layout->addWidget(title);
-        layout->addSpacerItem(new QSpacerItem(40, 20, QSizePolicy::Expanding, QSizePolicy::Minimum));
-
-        QString btnStyle = "QPushButton { background-color: transparent; color: #666666; font-weight: bold; border: none; font-size: 20px; padding-bottom: 5px; } QPushButton:hover { color: #FFFFFF; }";
-
-        QPushButton *btnHelp = new QPushButton("?", this);
-        btnHelp->setStyleSheet(btnStyle);
-        connect(btnHelp, &QPushButton::clicked, [this](){ emit requestHelp(); });
-        layout->addWidget(btnHelp);
-
-        QPushButton *btnMenu = new QPushButton("≡", this);
-        btnMenu->setStyleSheet(btnStyle);
-        layout->addWidget(btnMenu);
-
-        QMenu *settingsMenu = new QMenu(this);
-        settingsMenu->setStyleSheet("QMenu { background-color: #111111; color: #FFFFFF; font-family: Arial; font-weight: bold; border: 1px solid #55FF55; } QMenu::item:selected { background-color: #333333; }");
-
-        QAction *notesAction = new QAction("Sönkkö Notes", this);
-        connect(notesAction, &QAction::triggered, this, [this](){ emit requestNotes(); });
-        QAction *tofuAction = new QAction("TOFU List", this);
-        connect(tofuAction, &QAction::triggered, this, [this](){ emit requestTofuList(); });
-        QAction *settingsAction = new QAction("Settings", this);
-        connect(settingsAction, &QAction::triggered, this, [this](){ emit requestSettings(); });
-        QAction *lockAction = new QAction("Lock App", this);
-        connect(lockAction, &QAction::triggered, this, [this](){ emit requestLock(); });
-        QAction *clearAction = new QAction("Clear Screen", this);
-        connect(clearAction, &QAction::triggered, this, [this](){ emit requestClear(); });
-        QAction *quitAction = new QAction("Shutdown", this);
-        connect(quitAction, &QAction::triggered, this, [this](){ emit requestQuit(); });
-
-        settingsMenu->addAction(notesAction);
-        settingsMenu->addAction(tofuAction);
-        settingsMenu->addAction(settingsAction);
-        settingsMenu->addSeparator();
-        settingsMenu->addAction(lockAction);
-        settingsMenu->addAction(clearAction);
-        settingsMenu->addSeparator();
-        settingsMenu->addAction(quitAction);
-
-        connect(btnMenu, &QPushButton::clicked, [btnMenu, settingsMenu]() {
-            settingsMenu->popup(btnMenu->mapToGlobal(QPoint(0, btnMenu->height())));
-        });
-
-        QPushButton *btnClose = new QPushButton("X", this);
-        btnClose->setStyleSheet(btnStyle + "QPushButton:hover { color: #55FF55; }");
-        connect(btnClose, &QPushButton::clicked, [this]() { emit requestClose(); });
-        layout->addWidget(btnClose);
-    }
-
-signals:
-    void requestLock();
-    void requestClear();
-    void requestHelp();
-    void requestNotes();
-    void requestTofuList();
-    void requestSettings();
-    void requestQuit();
-    void requestClose();
-
-protected:
-    void paintEvent(QPaintEvent *event) override {
-        Q_UNUSED(event);
-        QPainter painter(this);
-        painter.setRenderHint(QPainter::Antialiasing);
-        int cut = 15;
-        QPolygon polygon;
-        polygon << QPoint(cut, 0) << QPoint(width() - cut, 0)
-                << QPoint(width(), height()) << QPoint(0, height());
-
-        painter.setBrush(QColor(15, 15, 15));
-        painter.setPen(Qt::NoPen);
-        painter.drawPolygon(polygon);
-        painter.setPen(QColor(40, 40, 40));
-        painter.drawLine(0, height() - 1, width(), height() - 1);
-    }
-    void mousePressEvent(QMouseEvent *event) override { if (event->button() == Qt::LeftButton) startPos = event->globalPosition().toPoint(); }
-    void mouseMoveEvent(QMouseEvent *event) override {
-        if (!startPos.isNull()) {
-            m_parent->move(m_parent->pos() + (event->globalPosition().toPoint() - startPos));
-            startPos = event->globalPosition().toPoint();
-        }
-    }
-    void mouseReleaseEvent(QMouseEvent *event) override { Q_UNUSED(event); startPos = QPoint(); }
-private:
-    QWidget *m_parent;
-    QPoint startPos;
-};
-
-// --- Main Application ---
 class ChatE2ETest;   // tests/test_chat.cpp drives the real class headlessly
+class ScreenshotTool; // tools/screenshots_app.cpp renders every screen
 
 class SecureChatApp : public QMainWindow {
     Q_OBJECT
     friend class ChatE2ETest;
+    friend class ScreenshotTool;
 public:
     // dataDirIn: where config/vault live. Empty = next to the executable (portable layout).
     explicit SecureChatApp(const QString &dataDirIn = QString()) : dataDir(dataDirIn) {
-        setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
-        setAttribute(Qt::WA_TranslucentBackground);
-        resize(1200, 800);
+        setWindowTitle("Sönkkökoodi");
+        resize(920, 660);
+        setMinimumSize(520, 400);
 
         myIdentityKey = nullptr;
         myEphemeralKey = nullptr;
         msgCount = 0;
-        autoLockMinutes = 1;
+        autoLockMinutes = 5;
+        tcpSocket = nullptr;
 
-        QWidget *centralWidget = new QWidget(this);
-        setCentralWidget(centralWidget);
-        QVBoxLayout *mainLayout = new QVBoxLayout(centralWidget);
-        mainLayout->setContentsMargins(0, 0, 0, 0);
-        mainLayout->setSpacing(0);
+        QWidget *central = new QWidget(this);
+        setCentralWidget(central);
+        QVBoxLayout *root = new QVBoxLayout(central);
+        root->setContentsMargins(0, 0, 0, 0);
+        root->setSpacing(0);
 
-        TechTopBar *topBar = new TechTopBar(this);
-        mainLayout->addWidget(topBar);
-        connect(topBar, &TechTopBar::requestLock, this, &SecureChatApp::lockSystem);
-        connect(topBar, &TechTopBar::requestClear, this, [this](){
-            history.clear();
-            chatDisplay->clear();
-            saveVault();
-        });
-        connect(topBar, &TechTopBar::requestHelp, this, &SecureChatApp::printHelp);
-        connect(topBar, &TechTopBar::requestNotes, this, &SecureChatApp::openNotes);
-        connect(topBar, &TechTopBar::requestTofuList, this, &SecureChatApp::openTofuList);
-        connect(topBar, &TechTopBar::requestSettings, this, &SecureChatApp::openSettings);
-        connect(topBar, &TechTopBar::requestQuit, this, &SecureChatApp::gracefulShutdown);
-        connect(topBar, &TechTopBar::requestClose, this, [this]() {
-            // Without a tray icon there would be no way to bring a hidden window back.
-            if (trayAvailable) hide();
-            else gracefulShutdown();
-        });
-
-        contentArea = new QWidget(this);
-        contentArea->setObjectName("mainContent");
-        contentArea->setStyleSheet("#mainContent { background-color: #000000; border: 2px solid #FF3333; border-top: none; }");
-
-        QVBoxLayout *contentLayout = new QVBoxLayout(contentArea);
-        contentLayout->setContentsMargins(15, 15, 15, 15);
-        contentLayout->setSpacing(0);
+        // Warning banner: used for impersonation and unpinned key delivery. Stays until dismissed.
+        banner = new QFrame(this);
+        banner->setObjectName("banner");
+        banner->setProperty("level", "warning");
+        banner->hide();
+        QHBoxLayout *bl = new QHBoxLayout(banner);
+        bl->setContentsMargins(sk::theme::kS4, sk::theme::kS2, sk::theme::kS4, sk::theme::kS2);
+        bannerLabel = new QLabel(banner);
+        bannerLabel->setWordWrap(true);
+        bannerLabel->setTextFormat(Qt::PlainText);
+        QPushButton *bannerClose = new QPushButton("Dismiss", banner);
+        bannerClose->setProperty("flat", true);
+        bl->addWidget(bannerLabel, 1);
+        bl->addWidget(bannerClose);
+        connect(bannerClose, &QPushButton::clicked, banner, &QWidget::hide);
+        root->addWidget(banner);
 
         mainStack = new QStackedWidget(this);
 
+        // Page 0: chat
+        QWidget *chatPage = new QWidget(this);
+        QVBoxLayout *cl = new QVBoxLayout(chatPage);
+        cl->setContentsMargins(0, 0, 0, sk::theme::kS3);
+        cl->setSpacing(sk::theme::kS2);
         chatDisplay = new QTextEdit(this);
+        chatDisplay->setObjectName("chatView");
         chatDisplay->setReadOnly(true);
-        chatDisplay->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        chatDisplay->setStyleSheet("background: transparent; color: #FFFFFF; border: none; font-family: 'Arial'; font-weight: bold; font-size: 16px;");
-        mainStack->addWidget(chatDisplay);
-
-        QWidget *loadingWidget = new QWidget(this);
-        QVBoxLayout *loadingLayout = new QVBoxLayout(loadingWidget);
-        loadingLabel = new QLabel("[*] LOADING...", loadingWidget);
-        loadingLabel->setAlignment(Qt::AlignCenter);
-        loadingLabel->setStyleSheet("color: #55FF55; font-weight: bold; font-family: 'Arial'; font-size: 20px; letter-spacing: 2px;");
-        loadingLayout->addWidget(loadingLabel);
-        mainStack->addWidget(loadingWidget);
-
-        contentLayout->addWidget(mainStack);
+        chatDisplay->setAccessibleName("Messages");
+        cl->addWidget(chatDisplay, 1);
 
         msgContainer = new QWidget(this);
-        QHBoxLayout *msgLayout = new QHBoxLayout(msgContainer);
-        msgLayout->setContentsMargins(5, 0, 0, 5);
-
-        promptLabel = new QLabel(">", this);
-        promptLabel->setStyleSheet("color: #55FF55; font-weight: bold; font-family: 'Arial'; font-size: 16px;");
-
+        QHBoxLayout *ml = new QHBoxLayout(msgContainer);
+        ml->setContentsMargins(sk::theme::kS4, 0, sk::theme::kS4, 0);
+        ml->setSpacing(sk::theme::kS2);
         msgInput = new QLineEdit(this);
-        msgInput->setStyleSheet("background: transparent; color: #FFFFFF; border: none; font-family: 'Arial'; font-weight: bold; font-size: 16px;");
+        msgInput->setPlaceholderText("Message   (Enter sends, Esc clears or locks)");
+        msgInput->setAccessibleName("Message");
+        QPushButton *sendBtn = new QPushButton("Send", this);
+        sendBtn->setProperty("primary", true);
         connect(msgInput, &QLineEdit::returnPressed, this, &SecureChatApp::handleInput);
+        connect(sendBtn, &QPushButton::clicked, this, &SecureChatApp::handleInput);
+        ml->addWidget(msgInput, 1);
+        ml->addWidget(sendBtn);
+        cl->addWidget(msgContainer);
+        mainStack->addWidget(chatPage);
 
-        msgLayout->addWidget(promptLabel);
-        msgLayout->addWidget(msgInput);
-        contentLayout->addWidget(msgContainer);
-
-        pinContainer = new QWidget(this);
-        QHBoxLayout *pinLayout = new QHBoxLayout(pinContainer);
-        pinLayout->setContentsMargins(5, 0, 0, 5);
-
-        QLabel *lockLabel = new QLabel("[LOCKED] >", this);
-        lockLabel->setStyleSheet("color: #FF3333; font-weight: bold; font-family: 'Arial'; font-size: 16px;");
-
-        pwdInput = new QLineEdit(this);
+        // Page 1: locked
+        QWidget *lockPage = new QWidget(this);
+        QVBoxLayout *ll = new QVBoxLayout(lockPage);
+        ll->addStretch(1);
+        QFrame *card = new QFrame(lockPage);
+        card->setObjectName("card");
+        QVBoxLayout *kl = new QVBoxLayout(card);
+        kl->setSizeConstraint(QLayout::SetFixedSize);
+        kl->setContentsMargins(sk::theme::kS5, sk::theme::kS5, sk::theme::kS5, sk::theme::kS5);
+        kl->setSpacing(sk::theme::kS3);
+        QLabel *lockTitle = new QLabel("Locked", card);
+        lockTitle->setProperty("role", "title");
+        QLabel *lockHint = new sk::ui::WrapLabel("Enter your password to unlock. Chat stays connected in the background.", 332, card);
+        lockHint->setProperty("role", "muted");
+        pwdInput = new QLineEdit(card);
         pwdInput->setEchoMode(QLineEdit::Password);
-        pwdInput->setStyleSheet("background: transparent; color: #FF3333; border: none; font-family: 'Arial'; font-weight: bold; font-size: 16px;");
+        pwdInput->setPlaceholderText("Password");
+        pwdInput->setAccessibleName("Password");
         connect(pwdInput, &QLineEdit::returnPressed, this, &SecureChatApp::handlePwdSubmit);
+        lockError = new sk::ui::WrapLabel(QString(), 332, card);
+        lockError->setProperty("role", "error");
+        kl->addWidget(lockTitle);
+        kl->addWidget(lockHint);
+        kl->addWidget(pwdInput);
+        kl->addWidget(lockError);
+        ll->addWidget(card, 0, Qt::AlignHCenter);
+        ll->addStretch(2);
+        mainStack->addWidget(lockPage);
+        pinContainer = lockPage;
 
-        pinLayout->addWidget(lockLabel);
-        pinLayout->addWidget(pwdInput);
-        contentLayout->addWidget(pinContainer);
+        root->addWidget(mainStack, 1);
 
-        mainLayout->addWidget(contentArea);
+        // Menu
+        QMenu *menu = menuBar()->addMenu("&Menu");
+        auto addAct = [this, menu](const QString &text, const QKeySequence &key, auto slot) {
+            QAction *a = menu->addAction(text);
+            if (!key.isEmpty()) a->setShortcut(key);
+            connect(a, &QAction::triggered, this, slot);
+            return a;
+        };
+        addAct("Notes", QKeySequence(), [this]() { openNotes(); });
+        addAct("Trusted identities", QKeySequence(), [this]() { openTofuList(); });
+        addAct("Room passphrase...", QKeySequence(), [this]() { askRoomPassphrase(); });
+        addAct("Settings", QKeySequence("Ctrl+,"), [this]() { openSettings(); });
+        menu->addSeparator();
+        addAct("Lock", QKeySequence("Ctrl+L"), [this]() { lockSystem(); });
+        addAct("Delete chat history...", QKeySequence(), [this]() { confirmClearHistory(); });
+        menu->addSeparator();
+        addAct("Help", QKeySequence(Qt::Key_F1), [this]() { openHelp(); });
+        addAct("Quit", QKeySequence("Ctrl+Q"), [this]() { gracefulShutdown(); });
 
-        tcpSocket = nullptr;
+        // Status chip: always visible, text + glyph (never color alone)
+        statusLabel = new QLabel(this);
+        statusLabel->setObjectName("statusChip");
+        statusLabel->setAccessibleName("Connection status");
+        statusBar()->addPermanentWidget(statusLabel);
+        statusBar()->setSizeGripEnabled(true);
 
         QShortcut *lockShortcut = new QShortcut(QKeySequence("Alt+L"), this);
         connect(lockShortcut, &QShortcut::activated, this, &SecureChatApp::lockSystem);
+        QShortcut *escShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), this);
+        connect(escShortcut, &QShortcut::activated, this, [this]() {
+            if (isLocked || setupStep != 0) return;
+            if (!msgInput->text().isEmpty()) msgInput->clear();
+            else lockSystem();
+        });
 
         vaultTimer = new QTimer(this);
         vaultTimer->setSingleShot(true);
@@ -349,8 +254,14 @@ public:
         autoLockTimer->setSingleShot(true);
         connect(autoLockTimer, &QTimer::timeout, this, &SecureChatApp::lockSystem);
 
+        statusTimer = new QTimer(this);
+        connect(statusTimer, &QTimer::timeout, this, [this]() { updateStatus(); });
+        statusTimer->start(500);
+
         setupSystemTray();
         loadConfiguration();
+        applyTheme();
+        updateStatus();
 
         // Any key press / click anywhere in the app counts as activity (including inside dialogs).
         qApp->installEventFilter(this);
@@ -366,6 +277,8 @@ public:
     }
 
     // Start hidden in the tray only when there is nothing to set up and a tray exists to restore from.
+    void startFirstRun() { runSetupIfNeeded(); }
+
     bool shouldStartHidden() const {
         return setupStep == 0 && trayAvailable;
     }
@@ -386,6 +299,18 @@ protected:
     }
 
     void closeEvent(QCloseEvent *event) override {
+        // With a tray the X button hides the window and keeps the connection; without one it quits
+        // (otherwise there would be no way to bring the window back).
+        if (!quitting && trayAvailable && !uninstalling) {
+            event->ignore();
+            hide();
+            if (!trayHintShown) {
+                trayHintShown = true;
+                trayIcon->showMessage("Still running", "Sönkkökoodi stays connected in the system tray. Use Menu > Quit to exit.",
+                                      QSystemTrayIcon::Information, 4000);
+            }
+            return;
+        }
         gracefulShutdown();
         QMainWindow::closeEvent(event);
     }
@@ -403,24 +328,21 @@ protected:
         return QMainWindow::eventFilter(obj, event);
     }
 
+    // Typing anywhere starts typing in the active input.
     void keyPressEvent(QKeyEvent *event) override {
-        bool printable = !event->text().isEmpty() && event->text().at(0).isPrint();
-        if (isLocked && setupStep != 2 && setupStep != 3) {
-            if (printable && !pwdInput->hasFocus()) {
-                pwdInput->setFocus();
-                QApplication::sendEvent(pwdInput, event);
-            }
-        } else {
-            if (printable && !msgInput->hasFocus()) {
-                msgInput->setFocus();
-                QApplication::sendEvent(msgInput, event);
-            }
+        const bool printable = !event->text().isEmpty() && event->text().at(0).isPrint();
+        QLineEdit *target = isLocked ? pwdInput : msgInput;
+        if (printable && setupStep == 0 && !target->hasFocus()) {
+            target->setFocus();
+            QApplication::sendEvent(target, event);
+            return;
         }
         QMainWindow::keyPressEvent(event);
     }
 
 private slots:
     void gracefulShutdown() {
+        quitting = true;
         flushVault();
         QTcpSocket *s = tcpSocket;
         if (s && s->state() == QAbstractSocket::ConnectedState && myIdentityKey) {
@@ -439,136 +361,68 @@ private slots:
         QApplication::quit();
     }
 
-    void printHelp() {
-        log("--- SÖNKKÖKOODI COMMANDS ---", "[ * ]", true);
-        log("nick <alias>   : Change your alias (1-24 letters, digits, _ - .)", "[ * ]", true);
-        log("who            : Display all active users in the room", "[ * ]", true);
-        log("clear          : Clear the terminal display", "[ * ]", true);
-        log("disconnect     : Disconnect from the current server", "[ * ]", true);
-        log("connect        : Connect to the saved server", "[ * ]", true);
-        log("passphrase     : Set the room passphrase (must match everyone in the room)", "[ * ]", true);
-        log("server <ip>    : Change the target server (ip or ip:port)", "[ * ]", true);
-        log("port <num>     : Change the target server port", "[ * ]", true);
-        log("help           : Show this list", "[ * ]", true);
-        log("Alt+L          : Force lock application", "[ * ]", true);
+    void openHelp() {
+        sk::ui::HelpDialog dlg(this);
+        activeDialog = &dlg;
+        dlg.exec();
+        activeDialog = nullptr;
+    }
+    void printHelp() { openHelp(); }
+
+    void applyTheme() {
+        qApp->setStyleSheet(sk::theme::styleSheet(fontScale));
     }
 
     void openSettings() {
-        if (isLocked) {
-            log("Cannot access Settings while system is locked.", "[ ! ]", true);
-            return;
-        }
-
-        QDialog dlg(this);
-        dlg.setWindowFlags(Qt::FramelessWindowHint | Qt::Dialog);
-        dlg.resize(450, 470);
-        dlg.setStyleSheet("background-color: #000000; border: 2px solid #55FF55; color: #55FF55; font-family: 'Arial'; font-weight: bold; font-size: 16px;");
-
-        QVBoxLayout *l = new QVBoxLayout(&dlg);
-        QLabel *lbl = new QLabel("SETTINGS", &dlg);
-        lbl->setStyleSheet("border: none; margin-bottom: 10px;");
-        l->addWidget(lbl);
-
-        QString chkStyle = "QCheckBox { color: #FFFFFF; font-weight: bold; font-family: 'Arial'; border: none; padding-top: 5px; padding-bottom: 5px; }"
-                           "QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #55FF55; background: #111111; }"
-                           "QCheckBox::indicator:checked { background: #55FF55; }";
-
-        QCheckBox *chkConnect = new QCheckBox("Desktop Alert: User Connect", &dlg);
-        chkConnect->setChecked(notifyConnect);
-        chkConnect->setStyleSheet(chkStyle);
-        l->addWidget(chkConnect);
-
-        QCheckBox *chkDisconnect = new QCheckBox("Desktop Alert: User Disconnect", &dlg);
-        chkDisconnect->setChecked(notifyDisconnect);
-        chkDisconnect->setStyleSheet(chkStyle);
-        l->addWidget(chkDisconnect);
-
-        QCheckBox *chkMessage = new QCheckBox("Desktop Alert: New Messages", &dlg);
-        chkMessage->setChecked(notifyMessage);
-        chkMessage->setStyleSheet(chkStyle);
-        l->addWidget(chkMessage);
-
-        QCheckBox *chkAutoStart = new QCheckBox("Start with Windows", &dlg);
-        chkAutoStart->setChecked(autoStart);
-        chkAutoStart->setStyleSheet(chkStyle);
+        if (isLocked) return;
+        sk::ui::SettingsValues cur;
+        cur.notifyConnect = notifyConnect; cur.notifyDisconnect = notifyDisconnect; cur.notifyMessage = notifyMessage;
+        cur.autoStart = autoStart; cur.autoLockMinutes = autoLockMinutes; cur.fontScale = fontScale;
 #ifdef Q_OS_WIN
-        l->addWidget(chkAutoStart);
+        const bool showAutoStart = true;
 #else
-        chkAutoStart->hide();
+        const bool showAutoStart = false;
 #endif
-
-        QLabel *lblTimeout = new QLabel("Auto-Lock Timeout:", &dlg);
-        lblTimeout->setStyleSheet("color: #FFFFFF; font-weight: bold; border: none; margin-top: 15px;");
-        l->addWidget(lblTimeout);
-
-        QComboBox *comboTimeout = new QComboBox(&dlg);
-        comboTimeout->setStyleSheet("QComboBox { background-color: #111111; color: #FFFFFF; font-weight: bold; font-family: 'Arial'; border: 1px solid #55FF55; padding: 5px; }"
-                                    "QComboBox::drop-down { border: none; }"
-                                    "QComboBox QAbstractItemView { background-color: #111111; color: #FFFFFF; selection-background-color: #333333; }");
-        comboTimeout->addItem("1 Minute", 1);
-        comboTimeout->addItem("5 Minutes", 5);
-        comboTimeout->addItem("15 Minutes", 15);
-        comboTimeout->addItem("60 Minutes", 60);
-        comboTimeout->addItem("Never", 0);
-
-        int idx = comboTimeout->findData(autoLockMinutes);
-        if (idx != -1) comboTimeout->setCurrentIndex(idx);
-        l->addWidget(comboTimeout);
-
-        l->addSpacerItem(new QSpacerItem(20, 40, QSizePolicy::Minimum, QSizePolicy::Expanding));
-
-        QPushButton *btnUninstall = new QPushButton("UNINSTALL SÖNKKÖKOODI", &dlg);
-        btnUninstall->setStyleSheet("QPushButton { background-color: #220000; border: 1px solid #FF3333; padding: 10px; color: #FF3333; } QPushButton:hover { background-color: #440000; color: #FFFFFF; }");
-        bool uninstallRequested = false;
-        connect(btnUninstall, &QPushButton::clicked, &dlg, [&dlg, &uninstallRequested]() {
-            uninstallRequested = true;
-            dlg.reject();
-        });
-        l->addWidget(btnUninstall);
-
-        QPushButton *btn = new QPushButton("SAVE & CLOSE", &dlg);
-        btn->setStyleSheet("QPushButton { background-color: #222222; border: 1px solid #55FF55; padding: 10px; color: #FFFFFF; } QPushButton:hover { background-color: #333333; }");
-        connect(btn, &QPushButton::clicked, &dlg, &QDialog::accept);
-        l->addWidget(btn);
-
+        sk::ui::SettingsDialog dlg(cur, showAutoStart, this);
         activeDialog = &dlg;
-        int result = dlg.exec();
+        const int result = dlg.exec();
         activeDialog = nullptr;
 
-        if (uninstallRequested) {
+        if (dlg.uninstallRequested) {
             performUninstall();
             return;
         }
+        if (result != QDialog::Accepted) return;
 
-        if (result == QDialog::Accepted) {
-            notifyConnect = chkConnect->isChecked();
-            notifyDisconnect = chkDisconnect->isChecked();
-            notifyMessage = chkMessage->isChecked();
-            autoLockMinutes = comboTimeout->currentData().toInt();
+        const sk::ui::SettingsValues v = dlg.values();
+        notifyConnect = v.notifyConnect;
+        notifyDisconnect = v.notifyDisconnect;
+        notifyMessage = v.notifyMessage;
+        autoLockMinutes = v.autoLockMinutes;
+        fontScale = v.fontScale;
 
-            QSettings settings(iniPath(), QSettings::IniFormat);
-            settings.setValue("notify_connect", notifyConnect);
-            settings.setValue("notify_disconnect", notifyDisconnect);
-            settings.setValue("notify_message", notifyMessage);
-            settings.setValue("auto_lock_minutes", autoLockMinutes);
+        QSettings settings(iniPath(), QSettings::IniFormat);
+        settings.setValue("notify_connect", notifyConnect);
+        settings.setValue("notify_disconnect", notifyDisconnect);
+        settings.setValue("notify_message", notifyMessage);
+        settings.setValue("auto_lock_minutes", autoLockMinutes);
+        settings.setValue("font_scale", fontScale);
 
 #ifdef Q_OS_WIN
-            if (chkAutoStart->isChecked() != autoStart) {
-                autoStart = chkAutoStart->isChecked();
-                settings.setValue("autostart", autoStart);
-                enableAutoStart(autoStart);
-            }
-#endif
-
-            if (autoLockMinutes > 0) {
-                autoLockTimer->setInterval(autoLockMinutes * 60000);
-                autoLockTimer->start();
-            } else {
-                autoLockTimer->stop();
-            }
-
-            log("Settings saved locally.", "[ * ]", true);
+        if (v.autoStart != autoStart) {
+            autoStart = v.autoStart;
+            settings.setValue("autostart", autoStart);
+            enableAutoStart(autoStart);
         }
+#endif
+        if (autoLockMinutes > 0) {
+            autoLockTimer->setInterval(autoLockMinutes * 60000);
+            autoLockTimer->start();
+        } else {
+            autoLockTimer->stop();
+        }
+        applyTheme();
+        log("Settings saved.", "", true);
     }
 
     // The whole folder may only be removed if the installer created it (marker file) or it carries the
@@ -591,42 +445,8 @@ private slots:
                                         && plannedDir.length() >= 4
                                         && !QDir(plannedDir).isRoot()
                                         && plannedDir != QDir::cleanPath(QDir::homePath());
-        QDialog warnDlg(this);
-        warnDlg.setWindowFlags(Qt::FramelessWindowHint | Qt::Dialog);
-        warnDlg.resize(560, 360);
-        warnDlg.setStyleSheet("background-color: #000000; border: 2px solid #FF3333; color: #FF3333; font-family: 'Arial'; font-weight: bold; font-size: 16px;");
 
-        QVBoxLayout *l = new QVBoxLayout(&warnDlg);
-        QLabel *lbl = new QLabel("CRITICAL WARNING", &warnDlg);
-        lbl->setAlignment(Qt::AlignCenter);
-        lbl->setStyleSheet("border: none; font-size: 22px;");
-        l->addWidget(lbl);
-
-        QLabel *desc = new QLabel(QString("This will permanently delete:\n"
-                                       "  - your identity key, chat vault, notes and settings\n"
-                                       "  - the desktop shortcut and the autostart entry\n")
-                              + (plannedWholeFolder
-                                     ? QString("  - the folder %1 and EVERYTHING inside it\n").arg(QDir::toNativeSeparators(plannedDir))
-                                     : QString("\nThe program files in %1 will NOT be deleted (this folder was not created by the installer). Remove them by hand if you want.\n").arg(QDir::toNativeSeparators(plannedDir)))
-                              + "\nThis cannot be undone.", &warnDlg);
-        desc->setWordWrap(true);
-        desc->setAlignment(Qt::AlignCenter);
-        desc->setStyleSheet("border: none; color: #FFFFFF; font-size: 14px;");
-        l->addWidget(desc);
-
-        QHBoxLayout *btnLayout = new QHBoxLayout();
-        QPushButton *btnCancel = new QPushButton("CANCEL", &warnDlg);
-        btnCancel->setStyleSheet("QPushButton { background-color: #222222; border: 1px solid #55FF55; color: #55FF55; padding: 10px; } QPushButton:hover { background-color: #333333; }");
-        connect(btnCancel, &QPushButton::clicked, &warnDlg, &QDialog::reject);
-
-        QPushButton *btnConfirm = new QPushButton("ERASE EVERYTHING", &warnDlg);
-        btnConfirm->setStyleSheet("QPushButton { background-color: #330000; border: 1px solid #FF3333; color: #FF3333; padding: 10px; } QPushButton:hover { background-color: #660000; color: #FFFFFF; }");
-        connect(btnConfirm, &QPushButton::clicked, &warnDlg, &QDialog::accept);
-
-        btnLayout->addWidget(btnCancel);
-        btnLayout->addWidget(btnConfirm);
-        l->addLayout(btnLayout);
-
+        sk::ui::UninstallDialog warnDlg(QDir::toNativeSeparators(plannedDir), plannedWholeFolder, this);
         activeDialog = &warnDlg;
         int result = warnDlg.exec();
         activeDialog = nullptr;
@@ -683,30 +503,38 @@ private slots:
         QApplication::quit();
     }
 
+    void confirmClearHistory() {
+        if (isLocked) return;
+        const auto answer = QMessageBox::question(this, "Delete chat history?",
+            "This permanently deletes the saved chat history on this device. It cannot be undone.",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (answer != QMessageBox::Yes) return;
+        history.clear();
+        chatDisplay->clear();
+        saveVault();
+    }
+
     void openNotes() {
-        if (isLocked || vaultKey.isEmpty()) {
-            log("Cannot access Sönkkö Notes while system is locked.", "[ ! ]", true);
-            return;
-        }
+        if (isLocked || vaultKey.isEmpty()) return;
 
         QDialog notesDlg(this);
-        notesDlg.setWindowFlags(Qt::FramelessWindowHint | Qt::Dialog);
-        notesDlg.resize(600, 500);
-        notesDlg.setStyleSheet("background-color: #000000; border: 2px solid #55FF55; color: #55FF55; font-family: 'Arial'; font-weight: bold; font-size: 16px;");
-
+        notesDlg.setWindowTitle("Notes");
+        notesDlg.resize(620, 480);
         QVBoxLayout *l = new QVBoxLayout(&notesDlg);
-        QLabel *lbl = new QLabel("SÖNKKÖ NOTES (Encrypted Locally)", &notesDlg);
-        lbl->setStyleSheet("border: none;");
-        l->addWidget(lbl);
+        l->setContentsMargins(sk::theme::kS5, sk::theme::kS5, sk::theme::kS5, sk::theme::kS5);
+        l->setSpacing(sk::theme::kS3);
+        l->addWidget(sk::ui::makeLabel("Notes", "title"));
+        l->addWidget(sk::ui::makeLabel("Encrypted on this device with your password. Saved when you close this window.", "muted"));
 
         QTextEdit *te = new QTextEdit(&notesDlg);
-        te->setStyleSheet("background-color: #111111; border: 1px solid #55FF55; color: #FFFFFF;");
-        l->addWidget(te);
-
-        QPushButton *btn = new QPushButton("SAVE & CLOSE", &notesDlg);
-        btn->setStyleSheet("QPushButton { background-color: #222222; border: 1px solid #55FF55; padding: 10px; color: #FFFFFF; } QPushButton:hover { background-color: #333333; }");
+        te->setAccessibleName("Notes");
+        l->addWidget(te, 1);
+        QPushButton *btn = sk::ui::makeButton("Save and close", &notesDlg, true);
+        QHBoxLayout *row = new QHBoxLayout();
+        row->addStretch(1);
+        row->addWidget(btn);
+        l->addLayout(row);
         connect(btn, &QPushButton::clicked, &notesDlg, &QDialog::accept);
-        l->addWidget(btn);
 
         const QString notesPath = dataPath("sonkkokoodi.notes");
         bool canSave = true;
@@ -746,50 +574,56 @@ private slots:
     }
 
     void openTofuList() {
-        if (isLocked) {
-            log("Cannot access TOFU List while system is locked.", "[ ! ]", true);
-            return;
-        }
-
-        QDialog tofuDlg(this);
-        tofuDlg.setWindowFlags(Qt::FramelessWindowHint | Qt::Dialog);
-        tofuDlg.resize(450, 500);
-        tofuDlg.setStyleSheet("background-color: #000000; border: 2px solid #55FF55; color: #55FF55; font-family: 'Arial'; font-weight: bold; font-size: 16px;");
-
-        QVBoxLayout *l = new QVBoxLayout(&tofuDlg);
-        QLabel *lbl = new QLabel("TRUSTED IDENTITIES (TOFU PINS)", &tofuDlg);
-        lbl->setStyleSheet("border: none;");
-        l->addWidget(lbl);
-
-        QTextEdit *te = new QTextEdit(&tofuDlg);
-        te->setReadOnly(true);
-        te->setStyleSheet("background-color: #111111; border: 1px solid #55FF55; color: #FFFFFF; font-size: 14px;");
-
-        QString listText;
-        for (auto it = trustedIdentities.begin(); it != trustedIdentities.end(); ++it) {
-            listText += "ID: " + (it.key().size() > 16 ? it.key().left(16) + "..." : it.key()) + (it.key().size() == 8 ? " (legacy short pin)" : "") + "\nALIAS: " + it.value() + "\n--------------------------------\n";
-        }
-        te->setPlainText(listText);
-        l->addWidget(te);
-
-        QPushButton *btn = new QPushButton("CLOSE", &tofuDlg);
-        btn->setStyleSheet("QPushButton { background-color: #222222; border: 1px solid #55FF55; padding: 10px; color: #FFFFFF;} QPushButton:hover { background-color: #333333; }");
-        connect(btn, &QPushButton::clicked, &tofuDlg, &QDialog::accept);
-        l->addWidget(btn);
-
-        activeDialog = &tofuDlg;
-        tofuDlg.exec();
+        if (isLocked) return;
+        sk::ui::TrustedDialog dlg(trustedIdentities, myUid, myNickname, this);
+        activeDialog = &dlg;
+        dlg.exec();
         activeDialog = nullptr;
     }
 
-    void showLoadingScreen(const QString &text, int timeoutMs = 0) {
-        loadingLabel->setText(text);
-        mainStack->setCurrentIndex(1);
-        if (timeoutMs > 0) {
-            QTimer::singleShot(timeoutMs, this, [this]() {
-                if (!isNegotiating) mainStack->setCurrentIndex(0);
-            });
+    // Kept for call sites; the connection state now lives in the always-visible status chip.
+    void showLoadingScreen(const QString &, int = 0) { updateStatus(); }
+
+    QString statusText() const { return statusLabel ? statusLabel->text() : QString(); }
+
+    void updateStatus() {
+        if (!statusLabel) return;
+        QString text, state, tip;
+        if (setupStep != 0) {
+            text = QString::fromUtf8("◌ Setting up"); state = "off"; tip = "First-run setup is not finished.";
+        } else if (isLocked) {
+            const bool up = tcpSocket && tcpSocket->state() == QAbstractSocket::ConnectedState;
+            text = QString::fromUtf8("■ Locked"); state = "off";
+            tip = up ? "Locked. Still connected in the background; messages are held until you unlock."
+                     : "Locked and not connected.";
+        } else if (!roomKeys.valid()) {
+            text = QString::fromUtf8("✖ No room passphrase"); state = "off";
+            tip = "Set one under Menu > Room passphrase to connect.";
+        } else if (!tcpSocket) {
+            if (reconnectTimer && reconnectTimer->isActive()) {
+                text = QString::fromUtf8("◐ Reconnecting..."); state = "working"; tip = "The connection was lost. Retrying automatically.";
+            } else {
+                text = QString::fromUtf8("✖ Disconnected"); state = "off"; tip = "Type 'connect' to join the relay.";
+            }
+        } else if (tcpSocket->state() != QAbstractSocket::ConnectedState) {
+            text = QString::fromUtf8("◐ Connecting..."); state = "working"; tip = "Reaching the relay server.";
+        } else if (isNegotiating || currentGroupKey.isEmpty()) {
+            text = QString::fromUtf8("◐ Negotiating keys..."); state = "working"; tip = "Waiting for the room key from another member.";
+        } else {
+            text = QString::fromUtf8("✔ Secure"); state = "secure"; tip = "Connected, end-to-end encrypted with the room key.";
         }
+        if (statusLabel->text() == text && statusLabel->property("state").toString() == state) return;
+        statusLabel->setText(text);
+        statusLabel->setToolTip(tip);
+        statusLabel->setProperty("state", state);
+        sk::ui::repolish(statusLabel);
+    }
+
+    void showBanner(const char *level, const QString &text) {
+        banner->setProperty("level", level);
+        bannerLabel->setText(text);
+        sk::ui::repolish(banner);
+        banner->show();
     }
 
     void loadConfiguration() {
@@ -811,7 +645,7 @@ private slots:
         notifyMessage = settings.value("notify_message", false).toBool();
         autoStart = settings.value("autostart", false).toBool();
 
-        autoLockMinutes = settings.value("auto_lock_minutes", 1).toInt();
+        autoLockMinutes = settings.value("auto_lock_minutes", 5).toInt();
         if (autoLockMinutes > 0) {
             autoLockTimer->setInterval(autoLockMinutes * 60000);
         }
@@ -825,18 +659,12 @@ private slots:
         bool hasPin = !pinCheck.isEmpty() || !storedPinHash.isEmpty();
         bool hasIdentity = !identityEnc.isEmpty() || !legacyPem.isEmpty();
 
+        fontScale = settings.value("font_scale", 100).toInt();
+        if (fontScale < 100 || fontScale > 200) fontScale = 100;
+
         isLocked = true;
-        msgContainer->hide();
-        pinContainer->show();
-        if (!hasPin || myNickname.isEmpty() || !hasIdentity || vaultSalt.isEmpty() || targetIp.isEmpty()) {
-            setupStep = 1;
-            pwdInput->setPlaceholderText("SETUP: CREATE NEW PASSWORD (min 8 chars)...");
-            log("INITIALIZATION: No credentials found. Step 1: Create a secure password.", "[ * ]", true);
-        } else {
-            setupStep = 0;
-            pwdInput->setPlaceholderText("ENTER PASSWORD...");
-            log("Locked. Enter password.", "[ * ]", true);
-        }
+        mainStack->setCurrentIndex(1);
+        setupStep = (!hasPin || myNickname.isEmpty() || !hasIdentity || vaultSalt.isEmpty() || targetIp.isEmpty()) ? 1 : 0;
     }
 
     void setupSystemTray() {
@@ -845,16 +673,20 @@ private slots:
         QPixmap trayPix(32, 32);
         trayPix.fill(Qt::transparent);
         QPainter p(&trayPix);
-        p.setPen(QColor("#55FF55"));
-        p.setFont(QFont("Arial", 14, QFont::Bold));
-        p.drawText(trayPix.rect(), Qt::AlignCenter, "SK");
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setBrush(QColor(sk::theme::kAccent));
+        p.setPen(Qt::NoPen);
+        p.drawEllipse(trayPix.rect().adjusted(1, 1, -1, -1));
+        p.setPen(QColor(sk::theme::kOnAccent));
+        p.setFont(QFont(sk::theme::kFontFamily, 15, QFont::Bold));
+        p.drawText(trayPix.rect(), Qt::AlignCenter, "S");
         p.end();
         trayIcon->setIcon(QIcon(trayPix));
 
         QMenu *trayMenu = new QMenu(this);
-        QAction *showAction = new QAction("Show Terminal", this);
+        QAction *showAction = new QAction("Show Sönkkökoodi", this);
         connect(showAction, &QAction::triggered, this, [this](){ this->showNormal(); this->activateWindow(); });
-        QAction *quitAction = new QAction("Shutdown Core", this);
+        QAction *quitAction = new QAction("Quit", this);
         connect(quitAction, &QAction::triggered, this, [this](){ gracefulShutdown(); });
 
         trayMenu->addAction(showAction);
@@ -886,163 +718,113 @@ private slots:
 #endif
     }
 
+    // Unlock with the password. (First-run setup lives in applySetup / SetupDialog.)
     void handlePwdSubmit() {
         QString input = pwdInput->text();
         if (input.isEmpty()) return;
         pwdInput->clear();
+        lockError->clear();
+        if (setupStep != 0) return;
 
         QSettings settings(iniPath(), QSettings::IniFormat);
-
-        if (setupStep == 1) {
-            if (input.size() < 8) {
-                log("Password too short (minimum 8 characters).", "[ ! ]", true);
-                return;
-            }
-
-            // Fresh setup: anything left over from a previous, incomplete setup cannot be decrypted
-            // with the new password. Keep it aside instead of deleting it.
-            for (const QString &n : { QString("sonkkokoodi.vault"), QString("sonkkokoodi.notes") }) {
-                QString p = dataPath(n);
-                if (QFileInfo::exists(p)) {
-                    QFile::remove(p + ".old");
-                    QFile::rename(p, p + ".old");
-                }
-            }
-            settings.remove("pin_hash");
-            settings.remove("ecdsa_identity");
-            settings.remove("ecdsa_identity_enc");
-            storedPinHash.clear();
-            legacyPem.clear();
-            identityEnc.clear();
-            if (myIdentityKey) { EVP_PKEY_free(myIdentityKey); myIdentityKey = nullptr; }
-            myUid.clear();
-
-            vaultSalt.resize(16);
-            if (RAND_bytes((unsigned char*)vaultSalt.data(), 16) != 1) {
-                log("Secure random generator failed.", "[ ! ]", true);
-                return;
-            }
-            settings.setValue("vault_salt", vaultSalt);
-
-            kdfIterations = sk::kPbkdf2Iterations;
-            settings.setValue("kdf_iter", kdfIterations);
-            vaultKey = derivePBKDF2(input, vaultSalt, kdfIterations);
-            if (vaultKey.isEmpty()) {
-                log("Key derivation failed - nothing was saved. Please try again.", "[ ! ]", true);
-                return;
-            }
-            pinCheck = makeVerifier(vaultKey);
-            settings.setValue("pin_check", pinCheck);
-            vaultLoaded = true;
-
-            setupStep = 2;
-            pinContainer->hide();
-            msgContainer->show();
-            msgInput->clear();
-            msgInput->setPlaceholderText("SETUP: ENTER ALIAS...");
-            promptLabel->setText("alias >");
-            msgInput->setFocus();
-            log("Password saved. Step 2: Enter your network alias/nickname.", "[ * ]", true);
-        } else if (setupStep == 0) {
-            QByteArray key = derivePBKDF2(input, vaultSalt, kdfIterations);
-            bool ok = false;
-            if (key.isEmpty()) {
-                log("Key derivation failed. Please try again.", "[ ! ]", true);
-                return;
-            }
-
-            if (!pinCheck.isEmpty()) {
-                ok = constTimeEqual(makeVerifier(key), pinCheck);
-            } else {
-                // Legacy install: verify with the old hash once, then upgrade to the PBKDF2 verifier.
-                QByteArray legacy = QCryptographicHash::hash(input.toUtf8(), QCryptographicHash::Sha256).toHex();
-                ok = constTimeEqual(legacy, storedPinHash.toUtf8());
-                if (ok) {
-                    pinCheck = makeVerifier(key);
-                    settings.setValue("pin_check", pinCheck);
-                    settings.remove("pin_hash");
-                    storedPinHash.clear();
-                }
-            }
-
-            if (!ok) {
-                failedAttempts++;
-                log("Invalid password.", "[ ! ]", true);
-                // Simple back-off against rapid guessing.
-                int delaySec = qMin(failedAttempts, 10);
-                pwdInput->setEnabled(false);
-                QTimer::singleShot(delaySec * 1000, this, [this]() {
-                    pwdInput->setEnabled(true);
-                    pwdInput->setFocus();
-                });
-                return;
-            }
-
-            failedAttempts = 0;
-            vaultKey = key;
-
-            if (!loadIdentityKey()) {
-                vaultKey.fill(0);
-                log("Could not load your identity key (settings file damaged?).", "[ ! ]", true);
-                return;
-            }
-
-            if (!vaultLoaded) {
-                loadVault();
-                vaultLoaded = true;
-            } else {
-                saveVault();
-            }
-
-            unlockSystem();
+        QByteArray key = derivePBKDF2(input, vaultSalt, kdfIterations);
+        if (key.isEmpty()) {
+            lockError->setText("Key derivation failed. Please try again.");
+            return;
         }
+        bool ok = false;
+
+        if (!pinCheck.isEmpty()) {
+            ok = constTimeEqual(makeVerifier(key), pinCheck);
+        } else {
+            // Legacy install: verify with the old hash once, then upgrade to the PBKDF2 verifier.
+            QByteArray legacy = QCryptographicHash::hash(input.toUtf8(), QCryptographicHash::Sha256).toHex();
+            ok = constTimeEqual(legacy, storedPinHash.toUtf8());
+            if (ok) {
+                pinCheck = makeVerifier(key);
+                settings.setValue("pin_check", pinCheck);
+                settings.remove("pin_hash");
+                storedPinHash.clear();
+            }
+        }
+
+        if (!ok) {
+            failedAttempts++;
+            const int delaySec = qMin(failedAttempts, 10);
+            lockError->setText(QString("Wrong password. You can try again in %1 s.").arg(delaySec));
+            pwdInput->setEnabled(false);
+            QTimer::singleShot(delaySec * 1000, this, [this]() {
+                pwdInput->setEnabled(true);
+                lockError->setText("Wrong password.");
+                if (isLocked) pwdInput->setFocus();
+            });
+            return;
+        }
+
+        failedAttempts = 0;
+        vaultKey = key;
+
+        if (!loadIdentityKey()) {
+            vaultKey.fill(0);
+            lockError->setText("Could not load your identity key (settings file damaged?).");
+            return;
+        }
+
+        // Messages that arrived while locked live only in memory; merge them into the reloaded vault.
+        QList<ChatMsg> pending;
+        for (const ChatMsg &m : history) if (!m.isTransient) pending.append(m);
+        if (!vaultLoaded) {
+            loadVault();
+            vaultLoaded = true;
+        }
+        for (const ChatMsg &m : pending) history.append(m);
+        while (history.size() > kMaxHistory) history.removeFirst();
+        if (!pending.isEmpty()) saveVault();
+
+        unlockSystem();
     }
 
     void lockSystem() {
         if (setupStep != 0 || isLocked) return;
 
-        // Close any open Notes/Settings/TOFU dialog first. Notes are saved synchronously
-        // while the vault key is still valid.
+        // Close any open dialog first. Notes are saved synchronously while the vault key is still valid.
         if (activeDialog) activeDialog->reject();
         flushVault();
 
         isLocked = true;
-        msgContainer->hide();
-        pinContainer->show();
+        mainStack->setCurrentIndex(1);
+        banner->hide();
         pwdInput->clear();
+        lockError->clear();
+        pwdInput->setEnabled(true);
         pwdInput->setFocus();
-        contentArea->setStyleSheet("#mainContent { background-color: #000000; border: 2px solid #FF3333; border-top: none; }");
-        log("Locked. Displaying raw AES-GCM sönkkökoodi.", "[ * ]", true);
-        refreshChatDisplay();
+
+        // Decrypted history leaves memory and the widget; it is reloaded from the vault on unlock.
+        chatDisplay->clear();
+        history.clear();
+        vaultLoaded = false;
 
         vaultKey.fill(0);
+        updateStatus();
     }
 
     void unlockSystem() {
         isLocked = false;
-        pinContainer->hide();
-        msgContainer->show();
+        mainStack->setCurrentIndex(0);
         msgInput->clear();
-        msgInput->setPlaceholderText("");
         msgInput->setFocus();
-        contentArea->setStyleSheet("#mainContent { background-color: #000000; border: 2px solid #55FF55; border-top: none; }");
-
         if (autoLockMinutes > 0) autoLockTimer->start();
 
         if (!roomKeys.valid()) loadRoomKeys();
+        refreshChatDisplay();
         if (!roomKeys.valid()) {            // new install, or an install from before protocol v2
-            refreshChatDisplay();
-            beginRoomPassphraseStep();
+            updateStatus();
+            QTimer::singleShot(0, this, &SecureChatApp::askRoomPassphrase);
             return;
         }
 
-        if (tcpSocket && tcpSocket->state() == QAbstractSocket::ConnectedState) {
-            promptLabel->setText("chat >");
-        } else {
-            promptLabel->setText(">");
-            if (!userDisconnected) connectToPeer();
-        }
-        refreshChatDisplay();
+        if (!(tcpSocket && tcpSocket->state() == QAbstractSocket::ConnectedState) && !userDisconnected) connectToPeer();
+        updateStatus();
     }
 
     bool loadRoomKeys() {
@@ -1057,49 +839,125 @@ private slots:
         return roomKeys.valid();
     }
 
-    void beginRoomPassphraseStep() {
-        setupStep = 4;
-        msgInput->clear();
-        msgInput->setEchoMode(QLineEdit::Password);
-        msgInput->setPlaceholderText("ROOM PASSPHRASE (shared out-of-band with the people you chat with)...");
-        promptLabel->setText("room >");
-        msgInput->setFocus();
-        log("Room passphrase: everyone in the room must enter the SAME passphrase. It authenticates the key exchange, so the relay or a stranger cannot obtain the room key. Use 12+ characters.", "[ * ]", true);
-    }
-
-    void handleRoomPassphrase(const QString &pass) {
-        msgInput->clear();
-        if (pass.size() < 8) {
-            log("Passphrase too short (minimum 8 characters, 12+ recommended).", "[ ! ]", true);
-            return;
-        }
-        static const char *hints[] = { "weak", "fair", "good", "strong" };
-        log(QString("Passphrase strength: %1 (length/variety estimate only).").arg(hints[sk::passphraseStrength(pass)]), "[ * ]", true);
+    // Derives and stores (encrypted under the vault key) the room keys. No UI.
+    bool storeRoomPassphrase(const QString &pass, QString *err = nullptr) {
+        auto fail = [&](const QString &m) { if (err) *err = m; return false; };
+        if (pass.size() < 8) return fail("The room passphrase must be at least 8 characters (12+ recommended).");
+        if (vaultKey.isEmpty()) return fail("The vault is locked.");
         sk::RoomKeys rk = sk::deriveRoomKeys(pass);
-        if (!rk.valid()) { log("Key derivation failed. Please try again.", "[ ! ]", true); return; }
+        if (!rk.valid()) return fail("Key derivation failed.");
         QByteArray packed = rk.auth + rk.wrap;
         QByteArray iv;
         QByteArray c = encryptGCM(packed, vaultKey, iv);
         packed.fill(0);
-        if (c.isEmpty()) { rk.wipe(); log("Could not store the room key.", "[ ! ]", true); return; }
+        if (c.isEmpty()) { rk.wipe(); return fail("Could not store the room key."); }
         roomEnc = iv + c;
         QSettings(iniPath(), QSettings::IniFormat).setValue("room_enc", roomEnc);
         roomKeys.wipe();
         roomKeys = rk;
+        return true;
+    }
 
-        msgInput->setEchoMode(QLineEdit::Normal);
-        msgInput->setPlaceholderText("");
-        setupStep = 0;
-        log("Room passphrase saved.", "[ * ]", true);
-        const bool reconnect = roomChangeRequested;
-        roomChangeRequested = false;
-        if (reconnect) {
+    // Asks for the room passphrase (upgrade from an older version, or a deliberate change) and reconnects.
+    void askRoomPassphrase() {
+        if (isLocked || setupStep != 0) return;
+        sk::ui::RoomPassphraseDialog dlg(this);
+        activeDialog = &dlg;
+        const int r = dlg.exec();
+        activeDialog = nullptr;
+        if (r == QDialog::Accepted) {
+            QString err;
+            if (!storeRoomPassphrase(dlg.passphrase(), &err)) { log(err, "[ ! ]", true); return; }
+            log("Room passphrase saved.", "", true);
             userDisconnected = false;
-            dropSocket(QString());
-            promptLabel->setText(">");
             connectToPeer();
-        } else {
-            unlockSystem();
+        } else if (!roomKeys.valid()) {
+            log("No room passphrase is set, so you are not connected. Use Menu > Room passphrase.", "[ ! ]", true);
+        }
+        updateStatus();
+    }
+
+    // --- First-run setup ------------------------------------------------------------------------
+    bool createVaultKey(const QString &password, QString *err) {
+        auto fail = [&](const QString &m) { if (err) *err = m; return false; };
+        if (password.size() < 8) return fail("The password must be at least 8 characters.");
+        QSettings settings(iniPath(), QSettings::IniFormat);
+
+        // Anything left over from a previous, incomplete setup cannot be decrypted with the new
+        // password. Keep it aside instead of deleting it.
+        for (const QString &n : { QString("sonkkokoodi.vault"), QString("sonkkokoodi.notes") }) {
+            QString p = dataPath(n);
+            if (QFileInfo::exists(p)) {
+                QFile::remove(p + ".old");
+                QFile::rename(p, p + ".old");
+            }
+        }
+        settings.remove("pin_hash");
+        settings.remove("ecdsa_identity");
+        settings.remove("ecdsa_identity_enc");
+        settings.remove("room_enc");
+        storedPinHash.clear();
+        legacyPem.clear();
+        identityEnc.clear();
+        roomEnc.clear();
+        roomKeys.wipe();
+        if (myIdentityKey) { EVP_PKEY_free(myIdentityKey); myIdentityKey = nullptr; }
+        myUid.clear();
+
+        vaultSalt.resize(16);
+        if (RAND_bytes((unsigned char*)vaultSalt.data(), 16) != 1) return fail("The secure random generator failed.");
+        QByteArray key = derivePBKDF2(password, vaultSalt, sk::kPbkdf2Iterations);
+        if (key.isEmpty()) return fail("Key derivation failed.");
+        kdfIterations = sk::kPbkdf2Iterations;
+        vaultKey = key;
+        pinCheck = makeVerifier(vaultKey);
+        settings.setValue("vault_salt", vaultSalt);
+        settings.setValue("kdf_iter", kdfIterations);
+        settings.setValue("pin_check", pinCheck);
+        vaultLoaded = true;
+        return true;
+    }
+
+    // Everything the first-run dialog collects, applied in one go. On success the app is unlocked and connecting.
+    bool applySetup(const QString &password, const QString &alias, const QString &server, const QString &room,
+                    QString *err = nullptr, int negotiationMs = -1) {
+        auto fail = [&](const QString &m) { if (err) *err = m; return false; };
+        if (!isValidNick(alias)) return fail("The alias must be 1-24 letters, digits, '_', '-' or '.'.");
+        QString host; int port = 9999; bool portGiven = false;
+        if (!parseEndpoint(server, host, port, portGiven)) return fail("The server must be a host or host:port (port 1-65535).");
+        if (room.size() < 8) return fail("The room passphrase must be at least 8 characters.");
+
+        if (!createVaultKey(password, err)) return false;
+        if (!generateIdentityKey()) return fail("Creating your identity key failed.");
+        if (!storeRoomPassphrase(room, err)) return false;
+
+        QSettings settings(iniPath(), QSettings::IniFormat);
+        settings.setValue("nickname", alias);
+        settings.setValue("server_ip", host);
+        settings.setValue("server_port", port);
+        settings.setValue("autostart", false);
+        myNickname = alias;
+        targetIp = host;
+        targetPort = port;
+
+        negotiationTimeoutOverrideMs = negotiationMs;
+        setupStep = 0;
+        unlockSystem();
+        return true;
+    }
+
+    void runSetupIfNeeded() {
+        if (setupStep == 0) return;
+        sk::ui::SetupDialog dlg(this);
+        activeDialog = &dlg;
+        const int r = dlg.exec();
+        activeDialog = nullptr;
+        if (r != QDialog::Accepted) { gracefulShutdown(); return; }
+        const sk::ui::SetupValues v = dlg.values();
+        QString err;
+        if (!applySetup(v.password, v.alias, v.server, v.room, &err)) {
+            QMessageBox::warning(this, "Setup failed", err);
+            QTimer::singleShot(0, this, &SecureChatApp::runSetupIfNeeded);
         }
     }
 
@@ -1137,7 +995,6 @@ private slots:
     }
 
     bool generateIdentityKey() {
-        log("Generating secp256r1 ECDSA Identity...", "[ * ]", true);
         EVP_PKEY *key = generateEphemeralKey();
         if (!key) return false;
 
@@ -1153,75 +1010,25 @@ private slots:
         }
 
         myUid = fingerprintOf(pkeyToDER(myIdentityKey));
-        log("Identity generated. ID: " + shortId(myUid), "[ * ]", true);
         return true;
     }
 
     void handleInput() {
-        if (setupStep == 4) { if (!msgInput->text().isEmpty()) handleRoomPassphrase(msgInput->text()); return; }
         QString text = msgInput->text().trimmed();
-        if (text.isEmpty()) return;
+        if (text.isEmpty() || isLocked || setupStep != 0) return;
         msgInput->clear();
-
-        if (setupStep == 2) {
-            if (!isValidNick(text)) {
-                log("Invalid alias. Use 1-24 letters, digits, '_', '-' or '.'.", "[ ! ]", true);
-                return;
-            }
-            log("alias > " + text, "", true);
-            if (!generateIdentityKey()) {
-                log("Identity generation failed.", "[ ! ]", true);
-                return;
-            }
-            QSettings settings(iniPath(), QSettings::IniFormat);
-            settings.setValue("nickname", text);
-            myNickname = text;
-
-            setupStep = 3;
-            msgInput->clear();
-            msgInput->setPlaceholderText("SETUP: ENTER SERVER IP (e.g. 192.168.1.50:9999)...");
-            promptLabel->setText("server >");
-            msgInput->setFocus();
-            log("Alias saved. Step 3: Enter target server IP and port.", "[ * ]", true);
-            return;
-        }
-
-        if (setupStep == 3) {
-            QString ip;
-            int port = 9999;
-            bool portGiven = false;
-            if (!parseEndpoint(text, ip, port, portGiven)) {
-                log("Invalid server address. Use host or host:port (port 1-65535).", "[ ! ]", true);
-                return;
-            }
-            log("server > " + text, "", true);
-
-            QSettings settings(iniPath(), QSettings::IniFormat);
-            settings.setValue("server_ip", ip);
-            settings.setValue("server_port", port);
-            settings.setValue("autostart", autoStart);
-            targetIp = ip;
-            targetPort = port;
-
-            if (autoStart) enableAutoStart(true);
-            setupStep = 0;
-            unlockSystem();
-            return;
-        }
 
         QString lowerText = text.toLower();
         bool connected = tcpSocket && tcpSocket->state() == QAbstractSocket::ConnectedState;
 
         if (lowerText == "clear") {
-            history.clear(); chatDisplay->clear();
-            saveVault();
+            confirmClearHistory();
             return;
         } else if (lowerText == "help") {
             printHelp();
             return;
         } else if (lowerText == "passphrase") {
-            roomChangeRequested = true;
-            beginRoomPassphraseStep();
+            QTimer::singleShot(0, this, &SecureChatApp::askRoomPassphrase);
             return;
         } else if (lowerText == "disconnect") {
             userDisconnected = true;
@@ -1331,7 +1138,6 @@ private slots:
 
         sendSignedPacket(chatObj);
 
-        selfGeneratedKey = false;
         saveMessage("", payloadText, cipherBytes, false, true, true);
 
         msgCount++;
@@ -1352,10 +1158,10 @@ private slots:
 
         connect(sock, &QTcpSocket::connected, this, [this, sock]() {
             if (sock != tcpSocket) return;
+            updateStatus();
             mySid.resize(8);
             if (RAND_bytes((unsigned char*)mySid.data(), 8) != 1) { dropSocket("Secure random generator failed."); return; }
             sendCtr = 0;
-            promptLabel->setText("chat >");
             startKeyNegotiation();
         });
         connect(sock, &QTcpSocket::readyRead, this, &SecureChatApp::receiveData);
@@ -1401,8 +1207,6 @@ private slots:
         seenSigs.clear();
         seenOrder.clear();
 
-        mainStack->setCurrentIndex(0);
-        if (setupStep == 0) promptLabel->setText(">");
         if (!reason.isEmpty()) {
             log(reason, "[ * ]", true);
             if (!userDisconnected && !uninstalling && myIdentityKey && setupStep == 0) {
@@ -1411,6 +1215,7 @@ private slots:
                 reconnectDelaySec = qMin(reconnectDelaySec * 2, 60);
             }
         }
+        updateStatus();
     }
 
     void sendNativeNotification(const QString &title, const QString &msg) {
@@ -1590,6 +1395,40 @@ private:
         }
     }
 
+    // Announces us to the room with a fresh ephemeral key and nonce. Used for the initial join and for the
+    // re-announcements a self-keyed node makes (see scheduleProbes). Only the LATEST hello can be answered.
+    bool sendHello() {
+        if (myEphemeralKey) EVP_PKEY_free(myEphemeralKey);
+        myEphemeralKey = generateEphemeralKey();
+        if (!myEphemeralKey) { dropSocket("Key generation failed."); return false; }
+
+        QJsonObject helloObj;
+        helloObj["type"] = "HELLO";
+        helloObj["nick"] = myNickname;
+        const QByteArray myEcdhDer = pkeyToDER(myEphemeralKey);
+        myHelloNonce.resize(16);
+        if (RAND_bytes((unsigned char*)myHelloNonce.data(), 16) != 1) { dropSocket("Secure random generator failed."); return false; }
+        helloObj["ecdh_pub"] = QString(myEcdhDer.toBase64());
+        helloObj["nonce"] = QString(myHelloNonce.toBase64());
+        helloObj["mac"] = QString(sk::helloMac(roomKeys, myEcdhDer, myHelloNonce, pkeyToDER(myIdentityKey)).toBase64());
+        sendSignedPacket(helloObj);
+        return true;
+    }
+
+    // A node that had to create the room key itself cannot know whether another keyed node exists that never
+    // saw its HELLO (e.g. it connected a moment later). It re-announces a few times; any keyed member answers,
+    // and the node with the HIGHER fingerprint adopts the other's key (adoptWelcomeWhileSelfKeyed).
+    void scheduleProbes() {
+        static const int delaysMs[] = { 1000, 4000, 9000, 16000, 30000 };
+        const int session = connectToken;
+        for (int d : delaysMs) {
+            QTimer::singleShot(d, this, [this, session]() {
+                if (session != connectToken || !tcpSocket || !selfGeneratedKey || isNegotiating) return;
+                sendHello();
+            });
+        }
+    }
+
     void startKeyNegotiation() {
         if (!roomKeys.valid()) { dropSocket("No room passphrase set. Type 'passphrase' to set one."); return; }
         isNegotiating = true;
@@ -1597,23 +1436,7 @@ private:
         pendingHellos.clear();
         showLoadingScreen("[*] NEGOTIATING CRYPTOGRAPHIC KEYS...");
 
-        if (myEphemeralKey) EVP_PKEY_free(myEphemeralKey);
-        myEphemeralKey = generateEphemeralKey();
-        if (!myEphemeralKey) {
-            dropSocket("Key generation failed.");
-            return;
-        }
-
-        QJsonObject helloObj;
-        helloObj["type"] = "HELLO";
-        helloObj["nick"] = myNickname;
-        const QByteArray myEcdhDer = pkeyToDER(myEphemeralKey);
-        myHelloNonce.resize(16);
-        if (RAND_bytes((unsigned char*)myHelloNonce.data(), 16) != 1) { dropSocket("Secure random generator failed."); return; }
-        helloObj["ecdh_pub"] = QString(myEcdhDer.toBase64());
-        helloObj["nonce"] = QString(myHelloNonce.toBase64());
-        helloObj["mac"] = QString(sk::helloMac(roomKeys, myEcdhDer, myHelloNonce, pkeyToDER(myIdentityKey)).toBase64());
-        sendSignedPacket(helloObj);
+        if (!sendHello()) return;
 
         // Randomised timeout so that two peers joining an empty room at the same moment do not
         // both give up simultaneously: the first one to time out creates the key and then answers
@@ -1639,6 +1462,7 @@ private:
             const QList<PendingHello> queued = pendingHellos;
             pendingHellos.clear();
             for (const PendingHello &h : queued) scheduleWelcome(h.der, h.nonce);
+            scheduleProbes();
         });
     }
 
@@ -1805,7 +1629,7 @@ private:
                 if (currentGroupKey.isEmpty()) continue;
 
                 QString joinNick = displayNameFor(senderUid, payload["nick"]);
-                log(joinNick + " is negotiating a connection (ID " + shortId(senderUid) + ")...", "[ * ]", true);
+                log(joinNick + " is joining (ID " + shortId(senderUid) + ")...", "[ * ]", true);
                 if (notifyConnect) {
                     sendNativeNotification("Connection", joinNick + " is joining the room.");
                 }
@@ -1860,6 +1684,7 @@ private:
                 // The key is only as trustworthy as whoever delivered it - make that visible.
                 if (!trustedIdentities.contains(senderUid)) {
                     log("Group key received from UNPINNED identity ID " + shortId(senderUid) + ". Verify it out-of-band if this matters.", "[ ! ]", true);
+                    showBanner("warning", "You received the room key from an identity you have not verified (ID " + shortId(senderUid) + "). If this matters, compare fingerprints under Menu > Trusted identities.");
                 }
 
                 currentGroupKey = decKey;
@@ -1965,6 +1790,7 @@ private:
                 if (!trustedIdentities.contains(senderUid)) {
                     if (nickTaken) {
                         isSpoofed = true;
+                        showBanner("error", "Possible impersonation: someone using the name '" + senderNick + "' is NOT the identity you know under that name. Do not trust their messages.");
                         if (norm == normNick(myNickname)) {
                             log("SPOOFING WARNING: ID " + shortId(senderUid) + " is attempting to impersonate YOU!", "[ ! ]");
                         } else {
@@ -1972,7 +1798,7 @@ private:
                         }
                     } else {
                         pinIdentity(senderUid, senderNick);
-                        log("TOFU: Pinned new identity '" + senderNick + "' (ID: " + shortId(senderUid) + ")");
+                        log("Remembered '" + senderNick + "' (ID " + shortId(senderUid) + ") the first time they were seen");
                         isVerified = true;
                     }
                 } else {
@@ -2010,19 +1836,6 @@ private:
 
     // --- Rendering ------------------------------------------------------------------------
 
-    QString getColorForNick(const QString &nick) {
-        if (nick == myNickname) return "#55FF55";
-
-        quint32 hash = 0;
-        for (int i = 0; i < nick.length(); ++i) {
-            hash = (hash << 5) + hash + nick[i].unicode();
-        }
-
-        int hue = hash % 360;
-        QColor color = QColor::fromHsv(hue, 200, 255);
-        return color.name();
-    }
-
     QString getTime() { return QDateTime::currentDateTime().toString("HH:mm:ss"); }
 
     void log(const QString &text, const QString &prefix = "[ * ]", bool isTransient = false) {
@@ -2043,59 +1856,47 @@ private:
         if (!isSystem && !isTransient && !isLocked) scheduleSaveVault();
     }
 
-    // Returns the HTML for one message, or an empty string if it must not be shown right now.
+    // Returns the HTML for one message, or an empty string if nothing should be shown right now.
+    // State is always spelled out in text/glyphs (verified / unverified / impersonation), never by color alone.
     QString renderLine(const ChatMsg &msg) {
-        QString prefixStr = msg.prefix.isEmpty() ? "" : msg.prefix.toHtmlEscaped() + " ";
+        if (isLocked) return QString();          // nothing decrypted is ever drawn while locked
+        namespace T = sk::theme;
+        const QString time = "<span style='color:" + QString(T::kTextMuted) + ";'>" + msg.time.toHtmlEscaped() + "</span>&nbsp;&nbsp;";
 
         if (msg.isSystem) {
-            // The lock screen must not leak who joined/left/was pinned.
-            if (isLocked && setupStep == 0 &&
-                !(msg.plainText.startsWith("Locked") || msg.plainText.startsWith("Invalid password"))) {
-                return QString();
-            }
-            return "<span style='color:#888888;'>[" + msg.time + "] " + prefixStr + msg.plainText.toHtmlEscaped() + "</span>";
+            const bool warn = msg.prefix.contains('!');
+            const QString color = warn ? T::kWarning : T::kTextMuted;
+            return time + "<span style='color:" + color + ";'>" + (warn ? QString::fromUtf8("⚠ ") : QString())
+                   + msg.plainText.toHtmlEscaped() + "</span>";
+        }
+        if (msg.isError) {
+            return time + "<span style='color:" + QString(T::kError) + ";'>" + QString::fromUtf8("⚠ ")
+                   + "A message could not be authenticated and was dropped.</span>";
         }
 
-        QString lineColor = "#FFFFFF";
-        QString displayContent;
+        const QString text = msg.plainText;
+        const int end = text.startsWith("<") ? text.indexOf('>') : -1;
+        if (end <= 1) return time + text.toHtmlEscaped();
 
-        if (isLocked) {
-            lineColor = "#AA3333";
-            displayContent = QString(msg.cipherText.toHex(' ').toUpper());
+        QString nick = text.mid(1, end - 1);
+        const bool spoofed = nick.endsWith(" (SPOOFER)");
+        if (spoofed) nick.chop(10);
+        const QString body = text.mid(end + 1).trimmed().toHtmlEscaped();
+
+        QString nickHtml = "<b style='color:" + QString(msg.isSelf ? T::kAccent : T::kText) + ";'>" + nick.toHtmlEscaped() + "</b>";
+        QString badge;
+        QString bodyColor = T::kText;
+        if (spoofed) {
+            badge = " <b style='color:" + QString(T::kError) + ";'>" + QString::fromUtf8("⚠ IMPERSONATION") + "</b>";
+            bodyColor = T::kTextMuted;
+        } else if (msg.isSelf) {
+            badge = "";
+        } else if (msg.isVerified) {
+            badge = " <span style='color:" + QString(T::kSuccess) + ";'>" + QString::fromUtf8("✓ verified") + "</span>";
+        } else {
+            badge = " <span style='color:" + QString(T::kTextMuted) + ";'>(unverified)</span>";
         }
-        else if (msg.isError) {
-            lineColor = "#FF3333";
-            displayContent = msg.plainText.toHtmlEscaped();
-        }
-        else {
-            QString text = msg.plainText;
-            int end = text.startsWith("<") ? text.indexOf('>') : -1;
-            if (end != -1) {
-                QString rawNick = text.mid(1, end - 1);
-                QString cleanNick = rawNick;
-                cleanNick.replace(" (SPOOFER)", "");
-
-                QString nickColor = getColorForNick(cleanNick);
-                bool spoofed = rawNick.endsWith(" (SPOOFER)");
-                if (spoofed) nickColor = "#FF9900";
-
-                QString nickPart = text.left(end + 1).toHtmlEscaped();
-                QString restOfMessage = text.mid(end + 1).toHtmlEscaped();
-
-                if ((msg.isVerified || msg.isSelf) && !spoofed) {
-                    int bracketIndex = nickPart.lastIndexOf("&gt;");
-                    if (bracketIndex != -1) {
-                        nickPart.insert(bracketIndex, " <span style='color:#55FF55;'>✓</span>");
-                    }
-                }
-
-                displayContent = "<span style='color:" + nickColor + ";'>" + nickPart + "</span><span style='color:#FFFFFF;'>" + restOfMessage + "</span>";
-            } else {
-                displayContent = text.toHtmlEscaped();
-            }
-        }
-
-        return "<span style='color:" + lineColor + ";'>[" + msg.time + "] " + prefixStr + displayContent + "</span>";
+        return time + nickHtml + badge + "&nbsp;&nbsp;<span style='color:" + bodyColor + ";'>" + body + "</span>";
     }
 
     void refreshChatDisplay() {
@@ -2108,11 +1909,17 @@ private:
     }
 
     QStackedWidget *mainStack;
-    QLabel *loadingLabel;
+    QFrame *banner = nullptr;
+    QLabel *bannerLabel = nullptr;
+    QLabel *lockError = nullptr;
+    QLabel *statusLabel = nullptr;
+    QTimer *statusTimer = nullptr;
+    int fontScale = 100;
+    bool quitting = false;
+    bool trayHintShown = false;
     QTextEdit *chatDisplay;
     QLineEdit *msgInput, *pwdInput;
-    QLabel *promptLabel;
-    QWidget *msgContainer, *pinContainer, *contentArea;
+    QWidget *msgContainer, *pinContainer;
     QSystemTrayIcon *trayIcon;
     QTimer *autoLockTimer;
     QTimer *vaultTimer = nullptr;
@@ -2141,7 +1948,6 @@ private:
     quint64 sendCtr = 0;
     sk::ReplayGuard replayGuard;
     qint64 lastIgnoredLogMs = 0;
-    bool roomChangeRequested = false;
     QSet<QByteArray> seenSigs;
     QList<QByteArray> seenOrder;
 
@@ -2188,6 +1994,7 @@ int main(int argc, char *argv[]) {
     QGuiApplication::setDesktopFileName("sonkkokoodi.desktop");
 
     SecureChatApp window;
+    QTimer::singleShot(0, &window, [&window]() { window.startFirstRun(); });
 
     // --- STARTUP LOGIC: Hide in the tray if setup is complete (and a tray exists), otherwise show UI ---
     if (!window.shouldStartHidden()) {
