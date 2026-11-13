@@ -51,12 +51,13 @@ set_target_properties(sonkkokoodi PROPERTIES WIN32_EXECUTABLE TRUE)
 if(WIN32)
     add_executable(sonkkokoodi_installer installer.cpp)
 
-    # The installer doesn't need OpenSSL, just Qt UI and Networking
+    # The installer needs Qt UI + Networking and the signature check from sk_crypto
     target_link_libraries(sonkkokoodi_installer PRIVATE
         Qt6::Core
         Qt6::Gui
         Qt6::Widgets
         Qt6::Network
+        sk_crypto            # Ed25519 signature check for release checksums
     )
 
     # Hide the black console window

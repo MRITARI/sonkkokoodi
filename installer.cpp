@@ -27,11 +27,18 @@
 #include <QDirIterator>
 #include <QFileInfo>
 #include <QProcessEnvironment>
+#include <functional>
+#include "sk_crypto.h"
 
 // =========================================================================
 // CONFIGURATION: CHANGE THIS TO YOUR GITHUB REPOSITORY
 // Format: "Username/Repository"
 const QString GITHUB_REPO = "MRITARI/sonkkokoodi"; 
+
+// Ed25519 public key (64 hex chars) that signs SHA256SUMS.txt in every release. See tools/gen-signing-key.sh.
+// While this is EMPTY the installer can only check GitHub's own digest, which shares a trust root with the
+// download itself (a compromised GitHub account defeats it). Set it, and signatures become mandatory.
+const QString SIGNING_PUBLIC_KEY_HEX = "";
 // =========================================================================
 
 // --- Custom Top Bar ---
@@ -209,6 +216,7 @@ private slots:
                 QJsonArray assets = releaseObj["assets"].toArray();
                 QString downloadUrl = "";
                 QString digest = "";
+                QString zipName, sumsUrl, sigUrl;
 
                 for (const QJsonValue &assetVal : assets) {
                     QJsonObject assetObj = assetVal.toObject();
@@ -216,8 +224,14 @@ private slots:
                     if (assetName.endsWith(".zip", Qt::CaseInsensitive) && !assetName.contains("installer", Qt::CaseInsensitive)) {
                         downloadUrl = assetObj["browser_download_url"].toString();
                         digest = assetObj["digest"].toString();   // "sha256:<hex>" when GitHub provides it
+                        zipName = assetName;
                         break;
                     }
+                }
+                for (const QJsonValue &assetVal : assets) {
+                    QJsonObject assetObj = assetVal.toObject();
+                    if (assetObj["name"].toString() == "SHA256SUMS.txt") sumsUrl = assetObj["browser_download_url"].toString();
+                    if (assetObj["name"].toString() == "SHA256SUMS.txt.sig") sigUrl = assetObj["browser_download_url"].toString();
                 }
 
                 if (!downloadUrl.isEmpty() && downloadUrl.startsWith("https://")) {
@@ -225,6 +239,9 @@ private slots:
                     if (releaseObj["prerelease"].toBool()) display += " (pre-release)";
                     releaseCombo->addItem(display, downloadUrl);
                     releaseCombo->setItemData(releaseCombo->count() - 1, digest, Qt::UserRole + 1);
+                    releaseCombo->setItemData(releaseCombo->count() - 1, zipName, Qt::UserRole + 2);
+                    releaseCombo->setItemData(releaseCombo->count() - 1, sumsUrl, Qt::UserRole + 3);
+                    releaseCombo->setItemData(releaseCombo->count() - 1, sigUrl, Qt::UserRole + 4);
                 }
             }
 
@@ -243,8 +260,50 @@ private slots:
         btnInstall->setEnabled(false);
         releaseCombo->setEnabled(false);
         
-        QString downloadUrl = releaseCombo->currentData().toString();
+        const QString downloadUrl = releaseCombo->currentData().toString();
         expectedDigest = releaseCombo->currentData(Qt::UserRole + 1).toString().toLower();
+        const QString zipName = releaseCombo->currentData(Qt::UserRole + 2).toString();
+        const QString sumsUrl = releaseCombo->currentData(Qt::UserRole + 3).toString();
+        const QString sigUrl = releaseCombo->currentData(Qt::UserRole + 4).toString();
+
+        const QByteArray pub = QByteArray::fromHex(SIGNING_PUBLIC_KEY_HEX.toLatin1());
+        if (pub.isEmpty()) {
+            log("Warning: release signatures are not configured in this installer; only GitHub's own checksum is checked.");
+            beginDownload(downloadUrl);
+            return;
+        }
+        if (sumsUrl.isEmpty() || sigUrl.isEmpty()) {
+            log("Refusing to install: this release has no signed checksum file (SHA256SUMS.txt + .sig).");
+            resetUi();
+            return;
+        }
+        log("Verifying release signature...");
+        fetchSmall(sumsUrl, [this, pub, sigUrl, zipName, downloadUrl](const QByteArray &sums) {
+            fetchSmall(sigUrl, [this, pub, sums, zipName, downloadUrl](const QByteArray &sig) {
+                if (!sk::verifyEd25519(pub, sums, sig)) {
+                    log("Refusing to install: the checksum file's signature is INVALID.");
+                    resetUi();
+                    return;
+                }
+                // Lines look like "<hex>  <filename>" (sha256sum output).
+                QString hex;
+                for (const QString &line : QString::fromUtf8(sums).split(QChar(0x0A))) {
+                    const QStringList parts = line.simplified().split(' ');
+                    if (parts.size() == 2 && QString(parts[1]).remove('*') == zipName) hex = parts[0].toLower();
+                }
+                if (hex.size() != 64) {
+                    log("Refusing to install: the signed checksum file does not list " + zipName + ".");
+                    resetUi();
+                    return;
+                }
+                expectedDigest = "sha256:" + hex;
+                log("Signature OK.");
+                beginDownload(downloadUrl);
+            });
+        });
+    }
+
+    void beginDownload(const QString &downloadUrl) {
         tempZipPath = QStandardPaths::writableLocation(QStandardPaths::TempLocation) + "/sonkko_install.zip";
         writeFailed = false;
         progressBar->setValue(0);
@@ -455,6 +514,25 @@ private slots:
     }
 
 private:
+    // Small text/binary files (checksums, signatures). Calls back with the bytes; on any failure aborts the install.
+    void fetchSmall(const QString &url, std::function<void(const QByteArray &)> done) {
+        if (!url.startsWith("https://")) { log("Refusing non-https URL."); resetUi(); return; }
+        QNetworkRequest request((QUrl(url)));
+        request.setRawHeader("User-Agent", "Sonkkokoodi-Installer-v1.0");
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        QNetworkReply *reply = networkManager->get(request);
+        connect(reply, &QNetworkReply::finished, this, [this, reply, done]() {
+            reply->deleteLater();
+            const QByteArray body = reply->read(65537);
+            if (reply->error() != QNetworkReply::NoError || body.isEmpty() || body.size() > 65536) {
+                log("Could not download the signed checksum files. Nothing was installed.");
+                resetUi();
+                return;
+            }
+            done(body);
+        });
+    }
+
     QNetworkAccessManager *networkManager;
     QNetworkReply *downloadReply;
     QFile *zipFile;

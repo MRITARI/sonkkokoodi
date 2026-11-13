@@ -131,6 +131,33 @@ private slots:
         QVERIFY(k1 != k0 && k2 != k1 && k2 != k0);
         QCOMPARE(k1.size(), 32);
     }
+    void ed25519Verify() {
+        EVP_PKEY_CTX *c = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
+        EVP_PKEY_keygen_init(c);
+        EVP_PKEY *raw = nullptr;
+        QVERIFY(EVP_PKEY_keygen(c, &raw) > 0);
+        EVP_PKEY_CTX_free(c);
+        PkeyPtr k(raw);
+        unsigned char pub[32]; size_t pl = sizeof(pub);
+        QVERIFY(EVP_PKEY_get_raw_public_key(k.get(), pub, &pl) == 1);
+        QByteArray rawPub(reinterpret_cast<char *>(pub), int(pl));
+        QByteArray msg = "abc123  Sonkkokoodi-v1-windows.zip\n";
+        EVP_MD_CTX *m = EVP_MD_CTX_new();
+        QVERIFY(EVP_DigestSignInit(m, nullptr, nullptr, nullptr, k.get()) == 1);
+        unsigned char sg[64]; size_t sl = sizeof(sg);
+        QVERIFY(EVP_DigestSign(m, sg, &sl, reinterpret_cast<const unsigned char *>(msg.constData()), size_t(msg.size())) == 1);
+        EVP_MD_CTX_free(m);
+        QByteArray sig(reinterpret_cast<char *>(sg), int(sl));
+        QVERIFY(verifyEd25519(rawPub, msg, sig));
+        QVERIFY(!verifyEd25519(rawPub, msg + "x", sig));                        // altered checksum file
+        QByteArray bad = sig; bad[5] = char(bad[5] ^ 1);
+        QVERIFY(!verifyEd25519(rawPub, msg, bad));                              // altered signature
+        QByteArray otherPub = rawPub; otherPub[0] = char(otherPub[0] ^ 1);
+        QVERIFY(!verifyEd25519(otherPub, msg, sig));                            // wrong key
+        QVERIFY(!verifyEd25519(rawPub.left(31), msg, sig));
+        QVERIFY(!verifyEd25519(rawPub, msg, sig.left(63)));
+        QVERIFY(!verifyEd25519(QByteArray(), msg, sig));
+    }
     void constantTimeEqual() {
         QVERIFY(constTimeEqual("abc", "abc"));
         QVERIFY(!constTimeEqual("abc", "abd"));

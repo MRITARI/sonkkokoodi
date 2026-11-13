@@ -16,7 +16,7 @@ Run the automated part: `python -m pytest tests -q` (relay) and `ctest --test-di
 | 5 | Unlock with a wrong password three times. | "Invalid password", growing delay, input re-enabled. | NOT RUN |
 | 6 | Notes: write text, close, reopen. Then write text and lock while the dialog is open. | Text persists in both cases. | NOT RUN |
 | 7 | Two clients and `python server.py`: send 40 messages in alternation. | All delivered, no `GCM AUTHENTICATION FAILED`, across 2+ ratchet boundaries (every 15). | **PASS** (automated: `test_chat` twoClientsShareKeyAndChatPastRatchet, 45 msgs, 3 boundaries) |
-| 8 | Same, but one client sends 40 messages in a burst. | Peer stays in sync or recovers. (Audit #6 predicts possible desync under relay rate limiting.) | NOT RUN |
+| 8 | Same, but one client sends 40 messages in a burst. | Peer stays in sync or recovers. (Audit #6 predicts possible desync under relay rate limiting.) | **PASS** (automated: burstSendIsDeliveredAndStaysInSync, 60-message burst; it failed before the pacing fix) |
 | 9 | Kill the relay mid-session. | Both clients show disconnected; no crash. | **PASS** (automated: relayKilledThenAutoReconnect) |
 | 10 | Restart the relay, type `connect` on both. | Keys renegotiate, chat resumes. (Audit #12: no auto-reconnect yet.) | **PASS** (automated; reconnect is now automatic, no manual `connect` needed) |
 | 11 | Start two clients within 0.3 s on an empty relay. | They end up in one room and can read each other. (Audit #14 suspects a split.) | **PASS** (automated: forcedSimultaneousKeyCreationConverges; the split was reproduced before the fix) |

@@ -184,6 +184,18 @@ QByteArray deriveSharedSecret(EVP_PKEY *myPriv, EVP_PKEY *peerPub) {
     return QCryptographicHash::hash(secret, QCryptographicHash::Sha256);
 }
 
+bool verifyEd25519(const QByteArray &rawPub, const QByteArray &msg, const QByteArray &sig) {
+    if (rawPub.size() != 32 || sig.size() != 64) return false;
+    PkeyPtr key(EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr,
+                                            reinterpret_cast<const unsigned char *>(rawPub.constData()), size_t(rawPub.size())));
+    if (!key) return false;
+    MdCtxPtr ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!ctx) return false;
+    if (EVP_DigestVerifyInit(ctx.get(), nullptr, nullptr, nullptr, key.get()) != 1) return false;
+    return EVP_DigestVerify(ctx.get(), reinterpret_cast<const unsigned char *>(sig.constData()), size_t(sig.size()),
+                            reinterpret_cast<const unsigned char *>(msg.constData()), size_t(msg.size())) == 1;
+}
+
 QByteArray ratchetStep(const QByteArray &key) {
     return QCryptographicHash::hash(key, QCryptographicHash::Sha256);
 }

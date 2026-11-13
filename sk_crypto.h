@@ -36,6 +36,9 @@ bool verify(const QByteArray &data, const QByteArray &sig, EVP_PKEY *pub);
 // ECDH, then SHA-256 of the shared secret. Empty = failure.
 QByteArray deriveSharedSecret(EVP_PKEY *myPriv, EVP_PKEY *peerPub);
 
+// Ed25519 signature check (raw 32-byte public key, raw 64-byte signature). Used to verify release checksums.
+bool verifyEd25519(const QByteArray &rawPub, const QByteArray &msg, const QByteArray &sig);
+
 // One step of the group-key hash ratchet.
 QByteArray ratchetStep(const QByteArray &key);
 

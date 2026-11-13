@@ -56,9 +56,9 @@ redesign and is not proposed unless you want it.
 - **Anyone who knows the passphrase** is fully trusted and reads everything. No per-member revocation. A leaked passphrase lets an attacker join future sessions.
 - **Offline passphrase guessing**: a recorded HELLO lets an attacker test guesses (scrypt N=2^15 slows it). Use a long random passphrase.
 - **Forward secrecy is limited**: the key is hashed forward every 15 messages. Stealing the current key reveals all later messages; there is no post-compromise recovery. A new member receives the current key.
-- **Ratchet desync** (audit #6) is not fixed: a client that misses more than 16 epochs of messages stays out of sync until it reconnects.
+- **Ratchet desync** (audit #6) is mostly fixed (clients pace sends so the relay no longer drops messages). A client that misses more than 256 epochs, or a message more than one epoch old, still cannot decrypt until it reconnects.
 - **Memory / running machine**: only the vault key is wiped on lock. Identity key, room keys, group key and decrypted history remain in memory while locked.
 - **Replay beyond the window or across a restarted peer**: a packet older than 120 s is rejected, but a malicious relay can still delay or drop messages, and clocks must agree within ~2 minutes.
 - **Local attacker with disk access** can edit the unauthenticated settings file (e.g. add a pin).
-- **Supply chain**: the installer verifies GitHub's published SHA-256 and refuses without one, but the checksum is not signed, so a compromised GitHub account defeats it.
+- **Supply chain**: release checksums can be Ed25519-signed and verified by the installer, but this is **inactive until you create the key** (`tools/gen-signing-key.sh`). Until then the installer trusts GitHub's own digest, which a compromised GitHub account defeats. The installer's own binary is not signed either (Windows SmartScreen will warn).
 - This is still unreviewed cryptography written by an LLM; see the README disclaimer.

@@ -65,8 +65,10 @@
 static const qint64 kMaxLineBytes     = 16384;  // max size of one incoming network line
 static const int    kMaxMessageBytes  = 3000;   // keeps the signed envelope under the relay's 8 KB limit
 static const int    kMaxHistory       = 1000;   // messages kept in memory / vault
+static const int    kSendIntervalMs   = 130;        // ~7.7 packets/s; the relay limit is 10/s
+static const int    kMaxOutQueue      = 100;    // refuse new input beyond this many queued packets
 static const int    kRatchetEvery     = 15;     // messages per group-key epoch
-static const int    kMaxEpochJump     = 16;     // how far a peer may be ahead of us
+static const int    kMaxEpochJump     = 256;    // how far a peer may be ahead of us
 
 struct ChatMsg {
     QString time;
@@ -1299,6 +1301,12 @@ private slots:
             return;
         }
 
+        if (outQueue.size() >= kMaxOutQueue) {
+            log("Sending too fast - wait a moment.", "[ ! ]", true);
+            msgInput->setText(text);
+            return;
+        }
+
         QString payloadText = "<" + myNickname + "> " + text;
         QByteArray plainBytes = payloadText.toUtf8();
         if (plainBytes.size() > kMaxMessageBytes) {
@@ -1388,6 +1396,8 @@ private slots:
         keyEpoch = 0;
         selfGeneratedKey = false;
         pendingHellos.clear();
+        outQueue.clear();
+        lastSendMs = 0;
         seenSigs.clear();
         seenOrder.clear();
 
@@ -1543,7 +1553,25 @@ private:
         envelope["sender_pub"] = QString(pkeyToDER(myIdentityKey).toBase64());
 
         QByteArray networkPacket = QJsonDocument(envelope).toJson(QJsonDocument::Compact) + "\n";
-        tcpSocket->write(networkPacket);
+        outQueue.append(networkPacket);
+        pumpOutQueue();
+    }
+
+    // The relay silently drops anything above 10 packets/s. Send at a steady pace below that (one packet
+    // per kSendIntervalMs, no bursts that network jitter could clump together) and queue the rest,
+    // otherwise a burst of messages "sends" fine locally and is lost on the way.
+    void pumpOutQueue() {
+        if (outQueue.isEmpty() || !tcpSocket) return;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        const qint64 due = lastSendMs + kSendIntervalMs;
+        if (now >= due) {
+            tcpSocket->write(outQueue.takeFirst());
+            lastSendMs = now;
+            if (outQueue.isEmpty()) return;
+            QTimer::singleShot(kSendIntervalMs, this, [this]() { pumpOutQueue(); });
+        } else {
+            QTimer::singleShot(int(due - now) + 1, this, [this]() { pumpOutQueue(); });
+        }
     }
 
     // --- Group key handling ---------------------------------------------------------------
@@ -2104,6 +2132,8 @@ private:
     int connectToken = 0;
     struct PendingHello { QByteArray der; QByteArray nonce; };
     QList<PendingHello> pendingHellos;
+    QList<QByteArray> outQueue;
+    qint64 lastSendMs = 0;
     sk::RoomKeys roomKeys;
     QByteArray roomEnc;
     QByteArray myHelloNonce;

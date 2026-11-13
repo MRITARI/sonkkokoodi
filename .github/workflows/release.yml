@@ -8,7 +8,7 @@ on:
   workflow_dispatch:        # manual run: builds and uploads an artifact, but does not publish a release
 
 permissions:
-  contents: write           # needed to create the release
+  contents: read            # the build job gets no write access and no secrets
 
 jobs:
   build-windows:
@@ -18,10 +18,10 @@ jobs:
         shell: msys2 {0}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up MSYS2 (UCRT64)
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
           msystem: UCRT64
           update: true
@@ -67,19 +67,47 @@ jobs:
         run: sha256sum Sonkkokoodi-*.zip > SHA256SUMS.txt
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-build
           path: |
             Sonkkokoodi-*.zip
             SHA256SUMS.txt
 
+  # Separate job: only this one can write to the repo and read the signing key,
+  # and it never runs code from the build tree.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-build
+
+      - name: Sign checksums (Ed25519)
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY is not set; publishing WITHOUT a signature. Installers with a configured public key will refuse this release."
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/sign.pem"
+          openssl pkeyutl -sign -rawin -inkey "$RUNNER_TEMP/sign.pem" -in SHA256SUMS.txt -out SHA256SUMS.txt.sig
+          rm -f "$RUNNER_TEMP/sign.pem"
+          ls -l SHA256SUMS.txt.sig
+
       - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             Sonkkokoodi-*-windows.zip
             Sonkkokoodi-Installer-*.zip
             SHA256SUMS.txt
+            SHA256SUMS.txt.sig
           generate_release_notes: true

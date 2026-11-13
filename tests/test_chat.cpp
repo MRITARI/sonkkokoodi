@@ -184,6 +184,33 @@ private slots:
         }
     }
 
+    // Manual test #8: one client fires a burst far above the relay's rate limit. Every message must still
+    // arrive (the client has to pace itself) and the ratchets must stay in step.
+    void burstSendIsDeliveredAndStaysInSync() {
+        stopRelay();
+        port = freePort();
+        startRelay();
+        auto a = makeApp("bua", "burst-a", "burst room passphrase");
+        QTRY_VERIFY_WITH_TIMEOUT(secure(a.get()), 15000);
+        auto b = makeApp("bub", "burst-b", "burst room passphrase");
+        QTRY_VERIFY_WITH_TIMEOUT(secure(b.get()), 15000);
+        const int N = 60;
+        for (int i = 0; i < N; ++i) say(a.get(), QString("burst-%1").arg(i));
+        QTRY_VERIFY_WITH_TIMEOUT(saw(b.get(), QString("burst-%1").arg(N - 1)), 30000);
+        int got = 0;
+        for (int i = 0; i < N; ++i) if (saw(b.get(), QString("burst-%1 ").arg(i)) || saw(b.get(), QString("burst-%1").arg(i))) ++got;
+        QString missing;
+        for (int i = 0; i < N; ++i) if (!saw(b.get(), QString("> burst-%1").arg(i))) missing += QString::number(i) + ",";
+        QVERIFY2(missing.isEmpty(), qPrintable("missing: " + missing + " gcmFailures=" + QString::number(gcmFailures(b.get()))
+                                               + " epochA=" + QString::number(a->keyEpoch) + " epochB=" + QString::number(b->keyEpoch)));
+        QCOMPARE(got, N);
+        QCOMPARE(gcmFailures(b.get()), 0);
+        // and the other direction still works afterwards
+        say(b.get(), "reply-after-burst");
+        QTRY_VERIFY_WITH_TIMEOUT(saw(a.get(), "reply-after-burst"), 5000);
+        QCOMPARE(a->keyEpoch, b->keyEpoch);
+    }
+
     void relayKilledThenAutoReconnect() {
         auto a = makeApp("ar", "alice3", "reconnect room passphrase");
         QTRY_VERIFY_WITH_TIMEOUT(secure(a.get()), 15000);
