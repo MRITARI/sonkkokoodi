@@ -16,7 +16,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Find Qt6 modules (Core, Gui, Widgets, and Network are required)
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network Test)
 
 # Find OpenSSL for AES-GCM and ECDSA cryptography
 find_package(OpenSSL REQUIRED)
@@ -24,6 +24,11 @@ find_package(OpenSSL REQUIRED)
 # ==============================================================================
 # 1. THE MAIN SECURE CHAT APPLICATION
 # ==============================================================================
+# Crypto primitives live in a GUI-free library so they can be unit tested.
+add_library(sk_crypto STATIC sk_crypto.cpp)
+target_include_directories(sk_crypto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(sk_crypto PUBLIC Qt6::Core OpenSSL::Crypto)
+
 add_executable(sonkkokoodi main.cpp)
 
 # Link Qt and OpenSSL to the main app
@@ -33,6 +38,7 @@ target_link_libraries(sonkkokoodi PRIVATE
     Qt6::Widgets
     Qt6::Network
     OpenSSL::Crypto
+    sk_crypto
 )
 
 # Hide the black console window on Windows (Ignored on Linux)
@@ -56,3 +62,11 @@ if(WIN32)
     # Hide the black console window
     set_target_properties(sonkkokoodi_installer PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
+
+# ==============================================================================
+# 3. TESTS  (ctest --test-dir build --output-on-failure)
+# ==============================================================================
+enable_testing()
+add_executable(test_crypto tests/test_crypto.cpp)
+target_link_libraries(test_crypto PRIVATE sk_crypto Qt6::Test)
+add_test(NAME crypto COMMAND test_crypto)

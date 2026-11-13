@@ -58,6 +58,7 @@
 #include <openssl/ec.h>
 #include <openssl/obj_mac.h>
 #include <openssl/crypto.h>
+#include "sk_crypto.h"
 
 // --- Limits ---
 static const qint64 kMaxLineBytes     = 16384;  // max size of one incoming network line
@@ -78,60 +79,11 @@ struct ChatMsg {
     bool isError = false;
 };
 
-using CipherCtxPtr = std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)>;
-using MdCtxPtr     = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
-using PkeyCtxPtr   = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
-
-// --- OpenSSL Helper Functions ---
-QByteArray pkeyToDER(EVP_PKEY *key) {
-    if (!key) return QByteArray();
-    unsigned char *der = nullptr;
-    int len = i2d_PUBKEY(key, &der);
-    if (len <= 0 || !der) return QByteArray();
-    QByteArray res((char*)der, len);
-    OPENSSL_free(der);
-    return res;
-}
-
-// Only accepts EC public keys; anything else (RSA, X25519, garbage) is rejected.
-EVP_PKEY* derToPkey(const QByteArray &der) {
-    if (der.isEmpty() || der.size() > 1024) return nullptr;
-    const unsigned char *p = (const unsigned char*)der.constData();
-    EVP_PKEY *key = d2i_PUBKEY(nullptr, &p, der.size());
-    if (key && EVP_PKEY_base_id(key) != EVP_PKEY_EC) {
-        EVP_PKEY_free(key);
-        return nullptr;
-    }
-    return key;
-}
-
-QByteArray privKeyToPEM(EVP_PKEY *key) {
-    BIO *bio = BIO_new(BIO_s_mem());
-    if (!bio) return QByteArray();
-    QByteArray res;
-    if (PEM_write_bio_PrivateKey(bio, key, nullptr, nullptr, 0, nullptr, nullptr) == 1) {
-        char *data = nullptr;
-        long len = BIO_get_mem_data(bio, &data);
-        if (len > 0 && data) res = QByteArray(data, len);
-    }
-    BIO_free(bio);
-    return res;
-}
-
-EVP_PKEY* pemToPrivKey(const QByteArray &pem) {
-    if (pem.isEmpty()) return nullptr;
-    BIO *bio = BIO_new_mem_buf(pem.constData(), pem.size());
-    if (!bio) return nullptr;
-    EVP_PKEY *key = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
-    BIO_free(bio);
-    return key;
-}
-
-static bool constTimeEqual(const QByteArray &a, const QByteArray &b) {
-    if (a.size() != b.size()) return false;
-    if (a.isEmpty()) return true;
-    return CRYPTO_memcmp(a.constData(), b.constData(), a.size()) == 0;
-}
+using sk::pkeyToDER;
+using sk::derToPkey;
+using sk::privKeyToPEM;
+using sk::pemToPrivKey;
+using sk::constTimeEqual;
 
 // Password check value derived from the (slow, salted) PBKDF2 key - never from the raw password.
 static QByteArray makeVerifier(const QByteArray &vaultKey) {
@@ -813,6 +765,7 @@ private slots:
         legacyPem = settings.value("ecdsa_identity").toString();    // legacy plaintext key, migrated on first unlock
         identityEnc = settings.value("ecdsa_identity_enc").toByteArray();
         vaultSalt = settings.value("vault_salt").toByteArray();
+        kdfIterations = settings.value("kdf_iter", sk::kLegacyPbkdf2Iterations).toInt();   // absent = pre-existing install
 
         notifyConnect = settings.value("notify_connect", true).toBool();
         notifyDisconnect = settings.value("notify_disconnect", true).toBool();
@@ -932,7 +885,13 @@ private slots:
             }
             settings.setValue("vault_salt", vaultSalt);
 
-            vaultKey = derivePBKDF2(input, vaultSalt);
+            kdfIterations = sk::kPbkdf2Iterations;
+            settings.setValue("kdf_iter", kdfIterations);
+            vaultKey = derivePBKDF2(input, vaultSalt, kdfIterations);
+            if (vaultKey.isEmpty()) {
+                log("Key derivation failed - nothing was saved. Please try again.", "[ ! ]", true);
+                return;
+            }
             pinCheck = makeVerifier(vaultKey);
             settings.setValue("pin_check", pinCheck);
             vaultLoaded = true;
@@ -946,8 +905,12 @@ private slots:
             msgInput->setFocus();
             log("Password saved. Step 2: Enter your network alias/nickname.", "[ * ]", true);
         } else if (setupStep == 0) {
-            QByteArray key = derivePBKDF2(input, vaultSalt);
+            QByteArray key = derivePBKDF2(input, vaultSalt, kdfIterations);
             bool ok = false;
+            if (key.isEmpty()) {
+                log("Key derivation failed. Please try again.", "[ ! ]", true);
+                return;
+            }
 
             if (!pinCheck.isEmpty()) {
                 ok = constTimeEqual(makeVerifier(key), pinCheck);
@@ -1333,16 +1296,9 @@ private:
     QString iniPath() const { return QCoreApplication::applicationDirPath() + "/sonkkokoodi.ini"; }
     QString dataPath(const QString &name) const { return QCoreApplication::applicationDirPath() + "/" + name; }
 
-    QByteArray derivePBKDF2(const QString &pwd, const QByteArray &salt) {
-        QByteArray pwdBytes = pwd.toUtf8();
-        QByteArray key;
-        key.resize(32);
-        if (PKCS5_PBKDF2_HMAC(pwdBytes.constData(), pwdBytes.size(),
-                              (const unsigned char*)salt.constData(), salt.size(),
-                              100000, EVP_sha256(), 32, (unsigned char*)key.data()) != 1) {
-            return QByteArray(32, '\0');
-        }
-        return key;
+    // Empty result = failure; callers must abort rather than continue with a weak key.
+    QByteArray derivePBKDF2(const QString &pwd, const QByteArray &salt, int iterations) {
+        return sk::pbkdf2(pwd.toUtf8(), salt, iterations);
     }
 
     // Atomic (temp file + rename) encrypted write: iv(12) | ciphertext | tag(16)
@@ -1426,111 +1382,17 @@ private:
         }
     }
 
-    QByteArray signData(const QByteArray &data) {
-        if (!myIdentityKey) return QByteArray();
-        MdCtxPtr ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-        if (!ctx) return QByteArray();
-        if (EVP_DigestSignInit(ctx.get(), nullptr, EVP_sha256(), nullptr, myIdentityKey) != 1) return QByteArray();
-        if (EVP_DigestSignUpdate(ctx.get(), data.constData(), data.size()) != 1) return QByteArray();
-        size_t siglen = 0;
-        if (EVP_DigestSignFinal(ctx.get(), nullptr, &siglen) != 1 || siglen == 0) return QByteArray();
-        QByteArray sig; sig.resize(siglen);
-        if (EVP_DigestSignFinal(ctx.get(), (unsigned char*)sig.data(), &siglen) != 1) return QByteArray();
-        sig.resize(siglen);
-        return sig;
-    }
+    QByteArray signData(const QByteArray &data) { return sk::sign(data, myIdentityKey); }
 
-    bool verifySignature(const QByteArray &data, const QByteArray &sig, EVP_PKEY *pubKey) {
-        if (!pubKey || sig.isEmpty()) return false;
-        MdCtxPtr ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-        if (!ctx) return false;
-        if (EVP_DigestVerifyInit(ctx.get(), nullptr, EVP_sha256(), nullptr, pubKey) != 1) return false;
-        if (EVP_DigestVerifyUpdate(ctx.get(), data.constData(), data.size()) != 1) return false;
-        return EVP_DigestVerifyFinal(ctx.get(), (const unsigned char*)sig.constData(), sig.size()) == 1;
-    }
+    bool verifySignature(const QByteArray &data, const QByteArray &sig, EVP_PKEY *pubKey) { return sk::verify(data, sig, pubKey); }
 
-    // Returns iv in `iv` and ciphertext||tag. Empty result = failure.
-    QByteArray encryptGCM(const QByteArray &plaintext, const QByteArray &key, QByteArray &iv) {
-        iv.clear();
-        if (key.size() != 32) return QByteArray();
+    QByteArray encryptGCM(const QByteArray &plaintext, const QByteArray &key, QByteArray &iv) { return sk::encryptGCM(plaintext, key, iv); }
 
-        QByteArray newIv(12, '\0');
-        if (RAND_bytes((unsigned char*)newIv.data(), 12) != 1) return QByteArray();
+    QByteArray decryptGCM(const QByteArray &c, const QByteArray &key, const QByteArray &iv, bool *ok = nullptr) { return sk::decryptGCM(c, key, iv, ok); }
 
-        CipherCtxPtr ctx(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
-        if (!ctx) return QByteArray();
-        if (EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) return QByteArray();
-        if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) != 1) return QByteArray();
-        if (EVP_EncryptInit_ex(ctx.get(), nullptr, nullptr, (const unsigned char*)key.constData(), (const unsigned char*)newIv.constData()) != 1) return QByteArray();
+    EVP_PKEY* generateEphemeralKey() { return sk::generateP256Key(); }
 
-        QByteArray out; out.resize(plaintext.size() + 16);
-        int len = 0;
-        if (EVP_EncryptUpdate(ctx.get(), (unsigned char*)out.data(), &len, (const unsigned char*)plaintext.constData(), plaintext.size()) != 1) return QByteArray();
-        int cipherLen = len;
-        if (EVP_EncryptFinal_ex(ctx.get(), (unsigned char*)out.data() + len, &len) != 1) return QByteArray();
-        cipherLen += len;
-
-        QByteArray tag(16, '\0');
-        if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_GET_TAG, 16, tag.data()) != 1) return QByteArray();
-
-        out.resize(cipherLen);
-        out.append(tag);
-        iv = newIv;
-        return out;
-    }
-
-    // `ok` distinguishes "valid empty plaintext" from "authentication failed".
-    QByteArray decryptGCM(const QByteArray &ciphertextWithTag, const QByteArray &key, const QByteArray &iv, bool *ok = nullptr) {
-        if (ok) *ok = false;
-        if (ciphertextWithTag.size() < 16 || key.size() != 32 || iv.size() != 12) return QByteArray();
-
-        QByteArray tag = ciphertextWithTag.right(16);
-        QByteArray ciphertext = ciphertextWithTag.left(ciphertextWithTag.size() - 16);
-
-        CipherCtxPtr ctx(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
-        if (!ctx) return QByteArray();
-        if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) return QByteArray();
-        if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) != 1) return QByteArray();
-        if (EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, (const unsigned char*)key.constData(), (const unsigned char*)iv.constData()) != 1) return QByteArray();
-
-        QByteArray out; out.resize(ciphertext.size());
-        int len = 0, outLen = 0;
-        if (EVP_DecryptUpdate(ctx.get(), (unsigned char*)out.data(), &len, (const unsigned char*)ciphertext.constData(), ciphertext.size()) != 1) return QByteArray();
-        outLen = len;
-
-        if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, 16, tag.data()) != 1) return QByteArray();
-        if (EVP_DecryptFinal_ex(ctx.get(), (unsigned char*)out.data() + len, &len) > 0) {
-            out.resize(outLen + len);
-            if (ok) *ok = true;
-            return out;
-        }
-        return QByteArray();
-    }
-
-    EVP_PKEY* generateEphemeralKey() {
-        PkeyCtxPtr pctx(EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr), EVP_PKEY_CTX_free);
-        if (!pctx) return nullptr;
-        if (EVP_PKEY_keygen_init(pctx.get()) <= 0) return nullptr;
-        if (EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx.get(), NID_X9_62_prime256v1) <= 0) return nullptr;
-        EVP_PKEY *key = nullptr;
-        if (EVP_PKEY_keygen(pctx.get(), &key) <= 0) return nullptr;
-        return key;
-    }
-
-    // Empty result = failure (wrong key type/curve, malformed key, ...). Never trust a peer-supplied key blindly.
-    QByteArray deriveSharedSecret(EVP_PKEY *myPriv, EVP_PKEY *peerPub) {
-        if (!myPriv || !peerPub) return QByteArray();
-        PkeyCtxPtr ctx(EVP_PKEY_CTX_new(myPriv, nullptr), EVP_PKEY_CTX_free);
-        if (!ctx) return QByteArray();
-        if (EVP_PKEY_derive_init(ctx.get()) <= 0) return QByteArray();
-        if (EVP_PKEY_derive_set_peer(ctx.get(), peerPub) <= 0) return QByteArray();
-        size_t len = 0;
-        if (EVP_PKEY_derive(ctx.get(), nullptr, &len) <= 0 || len == 0 || len > 128) return QByteArray();
-        QByteArray secret; secret.resize(len);
-        if (EVP_PKEY_derive(ctx.get(), (unsigned char*)secret.data(), &len) <= 0) return QByteArray();
-        secret.resize(len);
-        return QCryptographicHash::hash(secret, QCryptographicHash::Sha256);
-    }
+    QByteArray deriveSharedSecret(EVP_PKEY *myPriv, EVP_PKEY *peerPub) { return sk::deriveSharedSecret(myPriv, peerPub); }
 
     void sendSignedPacket(const QJsonObject &payload) {
         if (!tcpSocket) return;
@@ -1551,7 +1413,7 @@ private:
 
     void ratchetKey() {
         prevGroupKey = currentGroupKey;
-        currentGroupKey = QCryptographicHash::hash(currentGroupKey, QCryptographicHash::Sha256);
+        currentGroupKey = sk::ratchetStep(currentGroupKey);
         keyEpoch++;
         msgCount = 0;
     }
@@ -1797,7 +1659,7 @@ private:
             key = currentGroupKey;
             for (int i = 0; i < advance; ++i) {
                 prevForAdvance = key;
-                key = QCryptographicHash::hash(key, QCryptographicHash::Sha256);
+                key = sk::ratchetStep(key);
             }
         }
 
@@ -2009,6 +1871,7 @@ private:
     QList<QByteArray> seenOrder;
 
     QByteArray vaultSalt;
+    int kdfIterations = sk::kLegacyPbkdf2Iterations;
     QByteArray vaultKey;
     bool vaultLoaded = false;
     bool vaultWriteWarned = false;
