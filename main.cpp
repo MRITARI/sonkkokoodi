@@ -544,9 +544,10 @@ private slots:
 
         QPushButton *btnUninstall = new QPushButton("UNINSTALL SÖNKKÖKOODI", &dlg);
         btnUninstall->setStyleSheet("QPushButton { background-color: #220000; border: 1px solid #FF3333; padding: 10px; color: #FF3333; } QPushButton:hover { background-color: #440000; color: #FFFFFF; }");
-        connect(btnUninstall, &QPushButton::clicked, &dlg, [&dlg, this]() {
+        bool uninstallRequested = false;
+        connect(btnUninstall, &QPushButton::clicked, &dlg, [&dlg, &uninstallRequested]() {
+            uninstallRequested = true;
             dlg.reject();
-            QTimer::singleShot(100, this, &SecureChatApp::performUninstall);
         });
         l->addWidget(btnUninstall);
 
@@ -558,6 +559,11 @@ private slots:
         activeDialog = &dlg;
         int result = dlg.exec();
         activeDialog = nullptr;
+
+        if (uninstallRequested) {
+            performUninstall();
+            return;
+        }
 
         if (result == QDialog::Accepted) {
             notifyConnect = chkConnect->isChecked();
@@ -664,10 +670,15 @@ private slots:
             QProcess p;
             QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
             env.insert("SK_TARGET", QDir::toNativeSeparators(appDirPath));
+            env.insert("SK_PID", QString::number(QCoreApplication::applicationPid()));
             p.setProcessEnvironment(env);
             p.setProgram("powershell.exe");
+            // Wait for this process to exit (the exe and DLLs are locked until then), then retry the delete.
             p.setArguments(QStringList() << "-NoProfile" << "-WindowStyle" << "Hidden" << "-Command"
-                           << "Start-Sleep -Seconds 2; Remove-Item -LiteralPath $env:SK_TARGET -Recurse -Force");
+                           << "Wait-Process -Id $env:SK_PID -Timeout 30 -ErrorAction SilentlyContinue; "
+                              "for ($i = 0; $i -lt 20; $i++) { "
+                              "try { Remove-Item -LiteralPath $env:SK_TARGET -Recurse -Force -ErrorAction Stop; break } "
+                              "catch { Start-Sleep -Seconds 1 } }");
             p.setWorkingDirectory(QDir::tempPath());
             p.startDetached();
 #elif defined(Q_OS_LINUX)
@@ -2028,6 +2039,10 @@ private:
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
+
+    // The main window is a Qt::Tool window and lives in the tray. Without this, Qt quits the whole
+    // app as soon as a dialog (Settings, Notes, ...) closes. We quit explicitly instead.
+    app.setQuitOnLastWindowClosed(false);
 
     // --- LINUX FIX: Tell GNOME which .desktop file belongs to us ---
     QGuiApplication::setDesktopFileName("sonkkokoodi.desktop");
