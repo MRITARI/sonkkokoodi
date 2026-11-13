@@ -334,7 +334,11 @@ private slots:
             }
             log("SHA-256 verified.");
         } else {
-            log("Warning: GitHub published no checksum for this release, integrity could not be verified.");
+            // Fail closed: an unverifiable download is never installed.
+            log("Refusing to install: the release publishes no SHA-256 checksum, so the download cannot be verified.");
+            QFile::remove(tempZipPath);
+            resetUi();
+            return;
         }
 
         log("Extracting files...");
@@ -344,6 +348,20 @@ private slots:
         // Keep upgrading an existing installation in place so its settings and vault stay with it.
         if (QFileInfo::exists(legacyDir + "/sonkkokoodi.exe")) installDir = legacyDir;
         QDir().mkpath(installDir);
+
+        // An existing, running copy keeps its exe/DLLs locked; extracting over it would leave a mix of
+        // old and new files. Windows refuses write access to a running executable, which we use as the test.
+        const QString existingExe = installDir + "/sonkkokoodi.exe";
+        if (QFileInfo::exists(existingExe)) {
+            QFile probe(existingExe);
+            if (!probe.open(QIODevice::ReadWrite)) {
+                log("Sonkkokoodi appears to be running. Close it (also from the tray) and press Install again. Nothing was changed.");
+                QFile::remove(tempZipPath);
+                resetUi();
+                return;
+            }
+            probe.close();
+        }
 
         // Paths are passed through the environment, never spliced into the command text,
         // so quotes/apostrophes in a user name cannot break (or inject into) the command.
@@ -378,6 +396,11 @@ private slots:
                 return;
             }
 
+            {
+                // Tells the app's uninstaller that this folder was created by the installer.
+                QFile marker(QFileInfo(exePath).absolutePath() + "/.sonkkokoodi-install");
+                if (marker.open(QIODevice::WriteOnly)) marker.write("created by sonkkokoodi_installer\n");
+            }
             log("Extraction successful.");
             createShortcut(exePath);
         });

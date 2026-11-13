@@ -328,6 +328,16 @@ public:
         QShortcut *lockShortcut = new QShortcut(QKeySequence("Alt+L"), this);
         connect(lockShortcut, &QShortcut::activated, this, &SecureChatApp::lockSystem);
 
+        vaultTimer = new QTimer(this);
+        vaultTimer->setSingleShot(true);
+        connect(vaultTimer, &QTimer::timeout, this, [this]() { saveVault(); });
+
+        reconnectTimer = new QTimer(this);
+        reconnectTimer->setSingleShot(true);
+        connect(reconnectTimer, &QTimer::timeout, this, [this]() {
+            if (!userDisconnected && !uninstalling && myIdentityKey && !tcpSocket) connectToPeer();
+        });
+
         autoLockTimer = new QTimer(this);
         autoLockTimer->setSingleShot(true);
         connect(autoLockTimer, &QTimer::timeout, this, &SecureChatApp::lockSystem);
@@ -400,6 +410,7 @@ protected:
 
 private slots:
     void gracefulShutdown() {
+        flushVault();
         QTcpSocket *s = tcpSocket;
         if (s && s->state() == QAbstractSocket::ConnectedState && myIdentityKey) {
             QJsonObject leaveObj;
@@ -548,10 +559,29 @@ private slots:
         }
     }
 
+    // The whole folder may only be removed if the installer created it (marker file) or it carries the
+    // installer's own folder name. Anything else (a zip unpacked next to other files, a dev tree) is
+    // left alone apart from our own data files.
+    static bool isManagedInstallDir(const QString &dirPath) {
+        const QDir d(dirPath);
+        if (d.exists(".sonkkokoodi-install")) return true;
+        return d.dirName().compare("Sonkkokoodi", Qt::CaseInsensitive) == 0;
+    }
+    static bool looksLikeDevTree(const QDir &d) {
+        return d.exists("CMakeLists.txt") || d.exists("CMakeCache.txt") || d.exists(".git");
+    }
+
     void performUninstall() {
+        const QString plannedDir = QDir::cleanPath(QCoreApplication::applicationDirPath());
+        const bool plannedWholeFolder = isManagedInstallDir(plannedDir)
+                                        && !looksLikeDevTree(QDir(plannedDir))
+                                        && !looksLikeDevTree(QDir(plannedDir + "/.."))
+                                        && plannedDir.length() >= 4
+                                        && !QDir(plannedDir).isRoot()
+                                        && plannedDir != QDir::cleanPath(QDir::homePath());
         QDialog warnDlg(this);
         warnDlg.setWindowFlags(Qt::FramelessWindowHint | Qt::Dialog);
-        warnDlg.resize(450, 250);
+        warnDlg.resize(560, 360);
         warnDlg.setStyleSheet("background-color: #000000; border: 2px solid #FF3333; color: #FF3333; font-family: 'Arial'; font-weight: bold; font-size: 16px;");
 
         QVBoxLayout *l = new QVBoxLayout(&warnDlg);
@@ -560,7 +590,13 @@ private slots:
         lbl->setStyleSheet("border: none; font-size: 22px;");
         l->addWidget(lbl);
 
-        QLabel *desc = new QLabel("This will permanently delete Sönkkökoodi, your cryptographic keys, your local vault, and all settings.\n\nProceed with self-destruct?", &warnDlg);
+        QLabel *desc = new QLabel(QString("This will permanently delete:\n"
+                                       "  - your identity key, chat vault, notes and settings\n"
+                                       "  - the desktop shortcut and the autostart entry\n")
+                              + (plannedWholeFolder
+                                     ? QString("  - the folder %1 and EVERYTHING inside it\n").arg(QDir::toNativeSeparators(plannedDir))
+                                     : QString("\nThe program files in %1 will NOT be deleted (this folder was not created by the installer). Remove them by hand if you want.\n").arg(QDir::toNativeSeparators(plannedDir)))
+                              + "\nThis cannot be undone.", &warnDlg);
         desc->setWordWrap(true);
         desc->setAlignment(Qt::AlignCenter);
         desc->setStyleSheet("border: none; color: #FFFFFF; font-size: 14px;");
@@ -587,6 +623,8 @@ private slots:
         // Stop all activity so nothing re-creates files while we delete them.
         uninstalling = true;
         autoLockTimer->stop();
+        reconnectTimer->stop();
+        vaultTimer->stop();
         if (tcpSocket) {
             tcpSocket->disconnect(this);
             tcpSocket->abort();
@@ -603,20 +641,8 @@ private slots:
                                         "sonkkokoodi.vault.old", "sonkkokoodi.notes.old" };
         for (const QString &f : dataFiles) QFile::remove(appDirPath + "/" + f);
 
-        // Only remove the whole folder for a real installation. A development checkout / build tree
-        // (recognised by CMake or git files here or one level up) is never deleted - only its data files.
-        QDir appDir(appDirPath);
-        QDir parentDir(appDirPath + "/..");
-        auto looksLikeDevTree = [](const QDir &d) {
-            return d.exists("CMakeLists.txt") || d.exists("CMakeCache.txt") || d.exists(".git");
-        };
-        bool isDev = looksLikeDevTree(appDir) || looksLikeDevTree(parentDir);
-        bool hasExe = QFileInfo::exists(appDirPath + "/sonkkokoodi.exe") || QFileInfo::exists(appDirPath + "/sonkkokoodi");
-        bool unsafeLocation = appDirPath.length() < 4
-                              || QDir::cleanPath(appDirPath) == QDir::cleanPath(QDir::homePath())
-                              || appDir.isRoot();
-
-        if (!isDev && hasExe && !unsafeLocation) {
+        const bool hasExe = QFileInfo::exists(appDirPath + "/sonkkokoodi.exe") || QFileInfo::exists(appDirPath + "/sonkkokoodi");
+        if (plannedWholeFolder && hasExe) {
 #ifdef Q_OS_WIN
             // The path travels in an environment variable, so quotes in it can never break out of the command.
             QProcess p;
@@ -729,7 +755,7 @@ private slots:
 
         QString listText;
         for (auto it = trustedIdentities.begin(); it != trustedIdentities.end(); ++it) {
-            listText += "UID: " + it.key() + "\nALIAS: " + it.value() + "\n--------------------------------\n";
+            listText += "ID: " + (it.key().size() > 16 ? it.key().left(16) + "..." : it.key()) + (it.key().size() == 8 ? " (legacy short pin)" : "") + "\nALIAS: " + it.value() + "\n--------------------------------\n";
         }
         te->setPlainText(listText);
         l->addWidget(te);
@@ -770,7 +796,7 @@ private slots:
         notifyConnect = settings.value("notify_connect", true).toBool();
         notifyDisconnect = settings.value("notify_disconnect", true).toBool();
         notifyMessage = settings.value("notify_message", false).toBool();
-        autoStart = settings.value("autostart", true).toBool();
+        autoStart = settings.value("autostart", false).toBool();
 
         autoLockMinutes = settings.value("auto_lock_minutes", 1).toInt();
         if (autoLockMinutes > 0) {
@@ -965,6 +991,7 @@ private slots:
         // Close any open Notes/Settings/TOFU dialog first. Notes are saved synchronously
         // while the vault key is still valid.
         if (activeDialog) activeDialog->reject();
+        flushVault();
 
         isLocked = true;
         msgContainer->hide();
@@ -1027,7 +1054,7 @@ private slots:
         EVP_PKEY *key = pemToPrivKey(pem);
         if (!key) return false;
         myIdentityKey = key;
-        myUid = QString(QCryptographicHash::hash(pkeyToDER(myIdentityKey), QCryptographicHash::Sha256).toHex()).left(8);
+        myUid = fingerprintOf(pkeyToDER(myIdentityKey));
         return true;
     }
 
@@ -1047,8 +1074,8 @@ private slots:
             return false;
         }
 
-        myUid = QString(QCryptographicHash::hash(pkeyToDER(myIdentityKey), QCryptographicHash::Sha256).toHex()).left(8);
-        log("Identity generated. UID: " + myUid, "[ * ]", true);
+        myUid = fingerprintOf(pkeyToDER(myIdentityKey));
+        log("Identity generated. ID: " + shortId(myUid), "[ * ]", true);
         return true;
     }
 
@@ -1115,6 +1142,7 @@ private slots:
             return;
         } else if (lowerText == "disconnect") {
             userDisconnected = true;
+            reconnectTimer->stop();
             if (connected) {
                 QJsonObject leaveObj;
                 leaveObj["type"] = "LEAVE";
@@ -1128,6 +1156,8 @@ private slots:
             return;
         } else if (lowerText == "connect") {
             userDisconnected = false;
+            reconnectTimer->stop();
+            reconnectDelaySec = 2;
             if (connected || (tcpSocket && tcpSocket->state() != QAbstractSocket::UnconnectedState)) log("Already connected / connecting.", "[ * ]", true);
             else connectToPeer();
             return;
@@ -1264,6 +1294,7 @@ private slots:
             s->deleteLater();
         }
 
+        if (reconnectTimer) reconnectTimer->stop();
         isNegotiating = false;
         ++negotiationToken;          // cancels any pending negotiation timer
         ++connectToken;
@@ -1278,7 +1309,14 @@ private slots:
 
         mainStack->setCurrentIndex(0);
         if (setupStep == 0) promptLabel->setText(">");
-        if (!reason.isEmpty()) log(reason, "[ * ]", true);
+        if (!reason.isEmpty()) {
+            log(reason, "[ * ]", true);
+            if (!userDisconnected && !uninstalling && myIdentityKey && setupStep == 0) {
+                log("Reconnecting in " + QString::number(reconnectDelaySec) + " s (type 'disconnect' to stop).", "[ * ]", true);
+                reconnectTimer->start(reconnectDelaySec * 1000);
+                reconnectDelaySec = qMin(reconnectDelaySec * 2, 60);
+            }
+        }
     }
 
     void sendNativeNotification(const QString &title, const QString &msg) {
@@ -1310,6 +1348,14 @@ private:
         if (!file.open(QIODevice::WriteOnly)) return false;
         if (file.write(iv) != iv.size() || file.write(cipher) != cipher.size()) { file.cancelWriting(); return false; }
         return file.commit();
+    }
+
+    // Coalesces bursts of messages into one write. Always flushed before lock / quit.
+    void scheduleSaveVault() {
+        if (vaultTimer && !vaultTimer->isActive()) vaultTimer->start(400);
+    }
+    void flushVault() {
+        if (vaultTimer && vaultTimer->isActive()) { vaultTimer->stop(); saveVault(); }
     }
 
     void saveVault() {
@@ -1461,7 +1507,8 @@ private:
             prevGroupKey.clear();
             keyEpoch = 0;
             msgCount = 0;
-            showLoadingScreen("[*] SECURE TUNNEL ESTABLISHED", 1000);
+            reconnectDelaySec = 2;
+                showLoadingScreen("[*] SECURE TUNNEL ESTABLISHED", 1000);
 
             const QList<QByteArray> queued = pendingHellos;
             pendingHellos.clear();
@@ -1505,6 +1552,24 @@ private:
     }
 
     // --- Incoming data --------------------------------------------------------------------
+
+    // Identities are keyed by the FULL SHA-256 of the public key (256 bits). Only a short prefix is ever shown.
+    static QString fingerprintOf(const QByteArray &der) {
+        return QString::fromLatin1(QCryptographicHash::hash(der, QCryptographicHash::Sha256).toHex());
+    }
+    static QString shortId(const QString &fp) { return fp.left(8); }
+
+    // Pins made by older versions were keyed by the 8-character prefix. Upgrade one in place the first
+    // time its owner is seen again (the prefix match is what the old version relied on anyway).
+    void migrateLegacyPin(const QString &fp) {
+        const QString legacy = fp.left(8);
+        if (trustedIdentities.contains(fp) || !trustedIdentities.contains(legacy)) return;
+        const QString nick = trustedIdentities.take(legacy);
+        trustedIdentities.insert(fp, nick);
+        QSettings settings(iniPath(), QSettings::IniFormat);
+        settings.remove("TrustedIdentities/" + legacy);
+        settings.setValue("TrustedIdentities/" + fp, nick);
+    }
 
     QString displayNameFor(const QString &uid, const QJsonValue &claimedNick) {
         if (trustedIdentities.contains(uid)) return trustedIdentities.value(uid);
@@ -1550,7 +1615,8 @@ private:
             seenOrder.append(sigBytes);
             if (seenOrder.size() > 2048) seenSigs.remove(seenOrder.takeFirst());
 
-            QString senderUid = QString(QCryptographicHash::hash(pubBytes, QCryptographicHash::Sha256).toHex()).left(8);
+            QString senderUid = fingerprintOf(pubBytes);
+            migrateLegacyPin(senderUid);
             if (senderUid == myUid) continue;
 
             QJsonObject payload = QJsonDocument::fromJson(dataBytes).object();
@@ -1568,7 +1634,7 @@ private:
                 if (currentGroupKey.isEmpty()) continue;
 
                 QString joinNick = displayNameFor(senderUid, payload["nick"]);
-                log(joinNick + " is negotiating a connection (UID " + senderUid + ")...", "[ * ]", true);
+                log(joinNick + " is negotiating a connection (ID " + shortId(senderUid) + ")...", "[ * ]", true);
                 if (notifyConnect) {
                     sendNativeNotification("Connection", joinNick + " is joining the room.");
                 }
@@ -1599,7 +1665,7 @@ private:
 
                 // The key is only as trustworthy as whoever delivered it - make that visible.
                 if (!trustedIdentities.contains(senderUid)) {
-                    log("Group key received from UNPINNED identity UID " + senderUid + ". Verify it out-of-band if this matters.", "[ ! ]", true);
+                    log("Group key received from UNPINNED identity ID " + shortId(senderUid) + ". Verify it out-of-band if this matters.", "[ ! ]", true);
                 }
 
                 currentGroupKey = decKey;
@@ -1610,6 +1676,7 @@ private:
                 selfGeneratedKey = false;
                 ++negotiationToken;            // cancel the fallback timer
                 pendingHellos.clear();
+                reconnectDelaySec = 2;
                 showLoadingScreen("[*] SECURE TUNNEL ESTABLISHED", 1000);
             }
             else if (type == "LEAVE") {
@@ -1628,7 +1695,7 @@ private:
                 sendSignedPacket(repObj);
             }
             else if (type == "WHO_REP") {
-                log("Online: " + displayNameFor(senderUid, payload["nick"]) + " (UID: " + senderUid + ")", "[ * ]", true);
+                log("Online: " + displayNameFor(senderUid, payload["nick"]) + " (ID: " + shortId(senderUid) + ")", "[ * ]", true);
             }
             else if (type == "CHAT" && !currentGroupKey.isEmpty() && !isNegotiating) {
                 handleChat(payload, senderUid);
@@ -1668,7 +1735,7 @@ private:
         if (!key.isEmpty()) plainBytes = decryptGCM(cipherBytes, key, iv, &decOk);
 
         if (!decOk) {
-            saveMessage("[ ! ]", "<GCM AUTHENTICATION FAILED - DROPPED>", cipherBytes, false, false, false, false, true);
+            saveMessage("[ ! ]", "<GCM AUTHENTICATION FAILED - DROPPED>", cipherBytes, false, false, false, true, true);
             return;
         }
 
@@ -1705,13 +1772,13 @@ private:
                     if (nickTaken) {
                         isSpoofed = true;
                         if (norm == normNick(myNickname)) {
-                            log("SPOOFING WARNING: UID " + senderUid + " is attempting to impersonate YOU!", "[ ! ]");
+                            log("SPOOFING WARNING: ID " + shortId(senderUid) + " is attempting to impersonate YOU!", "[ ! ]");
                         } else {
-                            log("SPOOFING WARNING: UID " + senderUid + " is attempting to impersonate pinned alias '" + senderNick + "'!", "[ ! ]");
+                            log("SPOOFING WARNING: ID " + shortId(senderUid) + " is attempting to impersonate pinned alias '" + senderNick + "'!", "[ ! ]");
                         }
                     } else {
                         pinIdentity(senderUid, senderNick);
-                        log("TOFU: Pinned new identity '" + senderNick + "' (UID: " + senderUid + ")");
+                        log("TOFU: Pinned new identity '" + senderNick + "' (ID: " + shortId(senderUid) + ")");
                         isVerified = true;
                     }
                 } else {
@@ -1719,11 +1786,11 @@ private:
                         isVerified = true;
                     } else if (nickTaken) {
                         isSpoofed = true;
-                        log("SPOOFING WARNING: Known UID " + senderUid + " is attempting to change alias to already taken name '" + senderNick + "'!", "[ ! ]");
+                        log("SPOOFING WARNING: Known ID " + shortId(senderUid) + " is attempting to change alias to already taken name '" + senderNick + "'!", "[ ! ]");
                     } else {
                         QString oldNick = trustedIdentities.value(senderUid);
                         pinIdentity(senderUid, senderNick);
-                        log("Identity update: '" + oldNick + "' changed alias to '" + senderNick + "' (UID: " + senderUid + ")");
+                        log("Identity update: '" + oldNick + "' changed alias to '" + senderNick + "' (ID: " + shortId(senderUid) + ")");
                         isVerified = true;
                     }
                 }
@@ -1779,7 +1846,7 @@ private:
             chatDisplay->moveCursor(QTextCursor::End);
         }
 
-        if (!isSystem && !isLocked) saveVault();
+        if (!isSystem && !isTransient && !isLocked) scheduleSaveVault();
     }
 
     // Returns the HTML for one message, or an empty string if it must not be shown right now.
@@ -1854,6 +1921,9 @@ private:
     QWidget *msgContainer, *pinContainer, *contentArea;
     QSystemTrayIcon *trayIcon;
     QTimer *autoLockTimer;
+    QTimer *vaultTimer = nullptr;
+    QTimer *reconnectTimer = nullptr;
+    int reconnectDelaySec = 2;
     QPointer<QDialog> activeDialog;
 
     QTcpSocket *tcpSocket;
@@ -1879,7 +1949,7 @@ private:
     bool notifyConnect = true;
     bool notifyDisconnect = true;
     bool notifyMessage = false;
-    bool autoStart = true;
+    bool autoStart = false;
     int autoLockMinutes;
     bool trayAvailable = false;
     bool userDisconnected = false;
