@@ -31,9 +31,9 @@ Line numbers refer to `main.cpp` / `installer.cpp` at commit `aa675a8` (before t
 | 10 | installer.cpp:385-386 | `Expand-Archive -Force` over a running install: locked DLLs fail mid-way and leave a mix of old and new files. | Extract to a staging folder, then swap; refuse while the app runs. | partly fixed: installer refuses if the exe is locked (running). Still extracts in place (no staging swap). **Not tested** |
 | 11 | main.cpp:1133-1137 | Autostart is switched on silently at the end of setup (default true). | Default off; ask on the setup screen. | fixed in code (default off; only touches the registry when enabled). **Not tested** |
 | 12 | main.cpp:1281-1284 | No auto-reconnect. After the server dies the user has to type `connect`. | Reconnect with exponential back-off, visible state. | fixed, `test_chat` relayKilledThenAutoReconnect and noReconnectAfterUserDisconnect |
-| 13 | main.cpp:1006-1015 | While locked, decrypted `history` plaintext, the identity key, and the group key all stay in memory. Only the vault key is zeroed. The README claim is accurate only for the vault key. | Clear plaintext on lock; document the limit. | not fixed |
+| 13 | main.cpp:1006-1015 | While locked, decrypted `history` plaintext, the identity key, and the group key all stay in memory. Only the vault key is zeroed. The README claim is accurate only for the vault key. | Clear plaintext on lock; document the limit. | partly fixed: locking now clears decrypted history from the chat widget and the history list and zeroes the vault key (`test_chat` lockWipesPlaintextAndWrongPasswordIsRejected). The identity key, room keys and group key still stay in memory while locked |
 | 14 | main.cpp:1610-1613, 1590-1607 | Suspected: two clients joining an empty room within ~0.4 s of each other can each generate their own key and then swap WELCOMEs, ending with a split room (each holds the other's key). | Needs a two-client test; deterministic tie-break (lowest UID wins). | **reproduced and fixed**: forced collision made the clients swap keys; lowest-fingerprint tie-break fixes it. `test_chat` forcedSimultaneousKeyCreationConverges fails with the tie-break reverted and passes with it |
-| 15 | main.cpp:281 | `Qt::Tool` + frameless + translucent: no taskbar entry, no Alt-Tab, no resize, no snap. | Native frame (UX phase). | not fixed |
+| 15 | main.cpp:281 | `Qt::Tool` + frameless + translucent: no taskbar entry, no Alt-Tab, no resize, no snap. | Native frame (UX phase). | fixed in code: native frame (resize, snap, taskbar entry). **Drag, snap and resize were not exercised** (headless only) |
 | 16 | release.yml | Actions are pinned to tags, not commit SHAs. `msys2 update: true` is unpinned. Release checksum file is unsigned. Job-wide `contents: write`. | Pin by SHA, split build and release jobs, sign checksums. | fixed in the files (actions pinned by commit SHA, build and publish are separate jobs, secrets only in publish, new `ci.yml` runs all tests). **Not run on GitHub**: nothing was pushed, so neither workflow has executed; e.g. the MSYS2 pytest-asyncio package name is unverified |
 ## Low
 
@@ -43,7 +43,7 @@ Line numbers refer to `main.cpp` / `installer.cpp` at commit `aa675a8` (before t
 | 18 | main.cpp:1342 | PBKDF2 at 100,000 iterations is below current guidance (OWASP: 600,000 for PBKDF2-HMAC-SHA256). | fixed for new installs (600k iterations, count stored in `kdf_iter`). Existing installs stay at 100k until re-created |
 | 19 | main.cpp:1532 | The ECDH output is hashed with a bare SHA-256 and no context string. Use HKDF with transcript binding. | partly fixed: the room-key wrap now uses HMAC-based derivation with transcript binding. Vault/identity wrapping unchanged |
 | 20 | main.cpp:1332-1334, 827 | Settings and trust pins live in an unauthenticated INI file next to the exe; a local attacker can add a pin. | not fixed |
-| 21 | main.cpp:1017-1036 | Messages that arrive while locked are shown only in memory and can be lost on quit. | not fixed |
+| 21 | main.cpp:1017-1036 | Messages that arrive while locked are shown only in memory and can be lost on quit. | fixed: messages received while locked are merged into the vault on unlock (`test_chat` lockWipesPlaintextAndWrongPasswordIsRejected). Quitting while locked still loses them |
 | 22 | installer.cpp:248 | Fixed temp filename `sonkko_install.zip` in the shared temp folder. | not fixed |
 
 ## Relay (`server.py`), all reproduced by tests
@@ -61,3 +61,15 @@ Line numbers refer to `main.cpp` / `installer.cpp` at commit `aa675a8` (before t
 
 Not checked against the old server: I did not run the new tests against the previous `server.py`, so I
 cannot say which of them failed before. R3 was seen directly while the new code was being written.
+
+## Found and fixed during Phases 2-4 (not in the original list)
+
+| Problem | Evidence |
+|---|---|
+| A client burst above the relay's rate limit lost messages silently (and desynchronised the ratchet). | `burstSendIsDeliveredAndStaysInSync` failed (last message missing, then 55/60) before paced sending. |
+| Two clients that join a moment apart could end with different keys; the first tie-break only worked if both sides sent a WELCOME. | `staggeredJoinConverges` failed in round 3 before re-announcing; passes after. |
+| Closing the window crashed (the socket's `disconnected` handler touched already-destroyed timers). | e2e run crashed in `QTimer::stop`; fixed in the destructor. |
+| Alias look-alikes (a Cyrillic "a" in "alice") bypassed spoof detection. | `lookalikeNicksShareASkeleton`. |
+| Word-wrapped labels were clipped in the new dialogs and on the lock card. | `setupDialogsHaveNoClippedText` and `lockScreenTextIsNotClipped` fail with the fix reverted, pass with it. |
+| Button text "Save & close" lost its `&` to a keyboard mnemonic. | Seen in the "before" screenshot; the new dialogs avoid `&`. |
+| First-run setup could delete an existing autostart registry entry. | Code review; setup now only writes it when you enable it. |
